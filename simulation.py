@@ -76,6 +76,7 @@ def main():
     parser.add_argument("--output", type=Path, default=Path("outputs"))
     parser.add_argument("--prop-diameter-in", type=float, default=7)
     parser.add_argument("--prop-pitch-in", type=float, default=4.5, help="Recorded only; pitch effects are not modeled")
+    parser.add_argument("--mass-kg", type=float, default=2.2, help="Assumed total takeoff mass including battery and payload")
     parser.add_argument("--motor-kv", type=float, default=1500)
     parser.add_argument("--battery-cells", type=int, default=6)
     parser.add_argument("--battery-mah", type=float, default=4500)
@@ -84,7 +85,7 @@ def main():
                         help="Fixed forcing thickness [m], shared across grid comparisons")
     args = parser.parse_args()
     if not (all(np.isfinite(v) and v > 0 for v in
-                (args.prop_diameter_in, args.prop_pitch_in, args.motor_kv, args.battery_mah, args.battery_c, args.force_thickness))
+                (args.mass_kg, args.prop_diameter_in, args.prop_pitch_in, args.motor_kv, args.battery_mah, args.battery_c, args.force_thickness))
             and args.battery_cells > 0):
         parser.error("Hardware values and force thickness must be positive and finite")
     if not (0 <= args.throttle <= 1 and 0 < args.seconds <= 60
@@ -123,6 +124,10 @@ def main():
                delimiter=",", comments="",
                header="x_m,y_m,u_m_s,v_m_s,speed_m_s,pressure_Pa")
     summary = dict(estimates, simulated_seconds=t, steps=steps,
+                   assumed_total_mass_kg=args.mass_kg,
+                   required_hover_thrust_total_N=args.mass_kg*9.81,
+                   required_hover_thrust_per_motor_N=args.mass_kg*9.81/4,
+                   thrust_model_validated=False,
                    motor_kv=args.motor_kv, battery_cells=args.battery_cells,
                    battery_nominal_voltage_V=3.7*args.battery_cells,
                    battery_capacity_mAh=args.battery_mah, battery_c_rating=args.battery_c,
@@ -151,6 +156,9 @@ def main():
     throttles = np.linspace(0, 1, 101)
     axes[2].plot(throttles*100, [propeller(s, args.motor_kv, args.battery_cells, args.prop_diameter_in)["total_quad_thrust_N"] for s in throttles])
     axes[2].set(xlabel="Throttle [%]", ylabel="Estimated quad thrust [N]", title="Empirical thrust estimate")
+    axes[2].axhline(args.mass_kg*9.81, color="darkorange", linestyle="--",
+                    label=f"Hover target: {args.mass_kg:g} kg total mass")
+    axes[2].legend(fontsize=8)
     axes[2].grid(alpha=0.3)
     fig.suptitle("3D Mapping UAV — 2D periodic flow model\n"
                  f"Grid {args.grid}×{args.grid} | t={t:g} s | throttle={args.throttle:.0%} | "

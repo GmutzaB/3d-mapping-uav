@@ -83,3 +83,10 @@ grid size, so this is an initial refinement study, not an isolated spatial conve
 Propeller dimensions are configurable with `--prop-diameter-in 7 --prop-pitch-in 4.5`.
 Diameter controls the empirical thrust formula and rotor strip width. Pitch is recorded
 and displayed only; Ct and loaded RPM still need data for the chosen motor/prop combination.
+
+## Aircraft mass and hardware details
+
+See [HARDWARE.md](HARDWARE.md) for the supplied motor and two-blade 7×4.5 propeller
+specifications and unresolved mounting details. `--mass-kg` defaults to 2.2 kg total
+takeoff mass. The thrust chart shows the corresponding hover target; the summary saves
+total and per-motor required thrust. This does not validate the estimated thrust curve.
