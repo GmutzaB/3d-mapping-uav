@@ -1,1 +1,29 @@
-{"version":"0.2.0","configurations":[{"name":"Run UAV airflow simulation","type":"debugpy","request":"launch","program":"${workspaceFolder}/simulation.py","console":"integratedTerminal","cwd":"${workspaceFolder}"}]}
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run UAV airflow simulation",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "windows": {
+                "python": "${workspaceFolder}/.venv/Scripts/python.exe"
+            },
+            "program": "${workspaceFolder}/simulation.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Compare airflow grids",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "windows": {
+                "python": "${workspaceFolder}/.venv/Scripts/python.exe"
+            },
+            "program": "${workspaceFolder}/compare_grids.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}

@@ -8,10 +8,10 @@ os.environ.setdefault("MPLCONFIGDIR", str(Path(__file__).parent / ".mplconfig"))
 import numpy as np
 
 
-def propeller(throttle):
+def propeller(throttle, motor_kv=1500, battery_cells=6, prop_diameter_in=7):
     """Empirical static thrust estimate, independent of the flow solver."""
-    rho, diameter = 1.225, 0.127
-    rpm = 2200 * 14.8 * 0.80 * throttle
+    rho, diameter = 1.225, prop_diameter_in * 0.0254
+    rpm = motor_kv * (3.7 * battery_cells) * 0.80 * throttle
     thrust = 0.11 * rho * (rpm / 60)**2 * diameter**4
     area = np.pi * diameter**2 / 4
     return dict(rpm=rpm, thrust_per_motor_N=thrust,
@@ -74,16 +74,29 @@ def main():
     parser.add_argument("--viscosity", type=float, default=0.001,
                         help="Effective kinematic viscosity [m²/s], deliberately above air viscosity")
     parser.add_argument("--output", type=Path, default=Path("outputs"))
+    parser.add_argument("--prop-diameter-in", type=float, default=7)
+    parser.add_argument("--prop-pitch-in", type=float, default=4.5, help="Recorded only; pitch effects are not modeled")
+    parser.add_argument("--motor-kv", type=float, default=1500)
+    parser.add_argument("--battery-cells", type=int, default=6)
+    parser.add_argument("--battery-mah", type=float, default=4500)
+    parser.add_argument("--battery-c", type=float, default=50)
+    parser.add_argument("--force-thickness", type=float, default=0.05,
+                        help="Fixed forcing thickness [m], shared across grid comparisons")
     args = parser.parse_args()
+    if not (all(np.isfinite(v) and v > 0 for v in
+                (args.prop_diameter_in, args.prop_pitch_in, args.motor_kv, args.battery_mah, args.battery_c, args.force_thickness))
+            and args.battery_cells > 0):
+        parser.error("Hardware values and force thickness must be positive and finite")
     if not (0 <= args.throttle <= 1 and 0 < args.seconds <= 60
             and 24 <= args.grid <= 256 and args.grid % 2 == 0
             and np.isfinite(args.viscosity) and args.viscosity > 0):
         parser.error("Require throttle 0–1, seconds (0,60], even grid 24–256, positive finite viscosity")
     flow = Flow(args.grid, viscosity=args.viscosity)
-    estimates = propeller(args.throttle)
-    # Smoothed strip models a rotor cross-section. Thickness is resolved on the grid.
-    thickness = max(0.02, 2*flow.dx)
-    strip = np.exp(-(flow.X/0.0635)**8 - ((flow.Y-0.12)/thickness)**2)
+    estimates = propeller(args.throttle, args.motor_kv, args.battery_cells, args.prop_diameter_in)
+    # Hold the physical forcing width fixed when changing grid resolution.
+    thickness = args.force_thickness
+    radius = args.prop_diameter_in * 0.0254 / 2
+    strip = np.exp(-(flow.X/radius)**8 - ((flow.Y-0.12)/thickness)**2)
     flow.fy = -estimates["ideal_disk_pressure_jump_Pa"] / (1.225*thickness*np.sqrt(np.pi)) * strip
     # A periodic domain requires a balancing background to avoid bulk acceleration.
     flow.fy -= flow.fy.mean()
@@ -102,7 +115,24 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(args.output / "flow.npz", x=flow.x, y=flow.x,
                         u=flow.u, v=flow.v, pressure_Pa=pressure)
+    speed = np.hypot(flow.u, flow.v)
+    # One row per grid point for Numbers, Excel, and other spreadsheet apps.
+    np.savetxt(args.output / "flow.csv",
+               np.column_stack([field.ravel() for field in
+                                (flow.X, flow.Y, flow.u, flow.v, speed, pressure)]),
+               delimiter=",", comments="",
+               header="x_m,y_m,u_m_s,v_m_s,speed_m_s,pressure_Pa")
     summary = dict(estimates, simulated_seconds=t, steps=steps,
+                   motor_kv=args.motor_kv, battery_cells=args.battery_cells,
+                   battery_nominal_voltage_V=3.7*args.battery_cells,
+                   battery_capacity_mAh=args.battery_mah, battery_c_rating=args.battery_c,
+                   battery_nominal_energy_Wh=3.7*args.battery_cells*args.battery_mah/1000,
+                   propeller_diameter_m=2*radius, propeller_diameter_in=args.prop_diameter_in,
+                   propeller_pitch_in=args.prop_pitch_in, pitch_effects_modeled=False, thrust_coefficient=0.11,
+                   loaded_rpm_factor=0.8, force_thickness_m=thickness,
+                   peak_speed_m_s=float(speed.max()),
+                   rms_speed_m_s=float(np.sqrt(np.mean(speed**2))),
+                   pressure_min_Pa=float(pressure.min()), pressure_max_Pa=float(pressure.max()),
                    throttle=args.throttle, grid=args.grid, effective_viscosity_m2_s=flow.nu,
                    max_divergence_per_s=float(np.max(abs(flow.divergence()))))
     (args.output / "summary.json").write_text(json.dumps(summary, indent=2)+"\n")
@@ -110,24 +140,28 @@ def main():
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     fig, axes = plt.subplots(1, 3, figsize=(16, 4.8), layout="constrained")
-    speed = np.hypot(flow.u, flow.v)
     for ax, field, title, unit in zip(axes[:2], [speed, pressure],
             ["2D airflow speed", "Zero-mean pressure"], ["m/s", "Pa"]):
         im = ax.pcolormesh(flow.X, flow.Y, field, shading="auto", cmap="viridis")
         fig.colorbar(im, ax=ax, label=unit)
-        ax.plot([-0.0635, 0.0635], [0.12, 0.12], "r-", lw=3)
+        ax.plot([-radius, radius], [0.12, 0.12], "r-", lw=3)
         ax.set(xlabel="x [m]", ylabel="y [m]", title=title, aspect="equal")
     if speed.max() > 0:
         axes[0].streamplot(flow.x, flow.x, flow.u, flow.v, color="white", density=0.8, linewidth=0.5)
     throttles = np.linspace(0, 1, 101)
-    axes[2].plot(throttles*100, [propeller(s)["total_quad_thrust_N"] for s in throttles])
+    axes[2].plot(throttles*100, [propeller(s, args.motor_kv, args.battery_cells, args.prop_diameter_in)["total_quad_thrust_N"] for s in throttles])
     axes[2].set(xlabel="Throttle [%]", ylabel="Estimated quad thrust [N]", title="Empirical thrust estimate")
     axes[2].grid(alpha=0.3)
-    fig.suptitle("3D Mapping UAV — 2D periodic flow model")
+    fig.suptitle("3D Mapping UAV — 2D periodic flow model\n"
+                 f"Grid {args.grid}×{args.grid} | t={t:g} s | throttle={args.throttle:.0%} | "
+                 f"viscosity={flow.nu:g} m²/s | forcing width={thickness:g} m\n"
+                 f"Provisional: {args.motor_kv:g} KV, {args.battery_cells}S "
+                 f"{args.battery_mah:g} mAh {args.battery_c:g}C | {args.prop_diameter_in:g}×{args.prop_pitch_in:g} in prop (pitch not modeled), Ct=0.11")
     fig.savefig(args.output / "simulation.png", dpi=160)
     plt.close(fig)
     print(json.dumps(summary, indent=2))
     print(f"Results saved in {args.output.resolve()}")
+    print("Open simulation.png in Preview or flow.csv in Numbers / Excel.")
 
 
 if __name__ == "__main__":

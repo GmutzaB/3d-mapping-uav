@@ -20,6 +20,20 @@ class PhysicsTests(unittest.TestCase):
         expected = 1.225/4*(np.cos(2*f.X)+np.cos(2*f.Y))*decay**2
         np.testing.assert_allclose(pressure, expected, atol=1e-9)
 
+    def test_hardware_scaling(self):
+        base = propeller(0.5, motor_kv=1500, battery_cells=6)
+        self.assertAlmostEqual(base['rpm'], 1500 * 22.2 * 0.8 * 0.5)
+        doubled_kv = propeller(0.5, motor_kv=3000, battery_cells=6)
+        self.assertAlmostEqual(doubled_kv['thrust_per_motor_N'], 4 * base['thrust_per_motor_N'])
+        half_voltage = propeller(0.5, motor_kv=1500, battery_cells=3)
+        self.assertAlmostEqual(half_voltage['thrust_per_motor_N'], base['thrust_per_motor_N'] / 4)
+
+    def test_propeller_diameter_scaling(self):
+        small = propeller(0.5, prop_diameter_in=5)
+        large = propeller(0.5, prop_diameter_in=7)
+        self.assertAlmostEqual(large['thrust_per_motor_N'] / small['thrust_per_motor_N'], (7/5)**4)
+        self.assertAlmostEqual(large['ideal_disk_pressure_jump_Pa'] / small['ideal_disk_pressure_jump_Pa'], (7/5)**2)
+
     def test_throttle_squared(self):
         self.assertEqual(propeller(0)["thrust_per_motor_N"], 0)
         self.assertAlmostEqual(propeller(.5)["thrust_per_motor_N"] / propeller(1)["thrust_per_motor_N"], .25)
