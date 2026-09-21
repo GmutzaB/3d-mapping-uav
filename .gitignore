@@ -3,3 +3,22 @@ __pycache__/
 .DS_Store
 outputs/
 .mplconfig/
+
+# Downloaded supporting software and robotics build products
+/external/
+/build/
+/install/
+/log/
+
+# Local experiment artifacts
+/data/raw/
+/data/processed/
+*.bag
+*.mcap
+*.db3
+
+# Local credentials and machine-specific settings
+.env
+.env.*
+!.env.example
+*.local.*

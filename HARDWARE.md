@@ -75,8 +75,15 @@ Use `--mass-kg 2.2` with either simulation script to change the total mass assum
 
 ## Flight electronics and onboard computer
 
-- Planned flight controller / ESC: **Drake FPV FC/55A ESC stack**, as named by the user.
-  Exact product/version, mass, voltage rating, and rating conditions are not yet recorded.
+- Owned flight controller / ESC: **DAKEFPV H743 / 55A ESC stack**. The user supplied
+  a matching listing and reports the board is labeled H743, with no Pro marking.
+  Treat it as the standard H743 provisionally; verify board revision and installed
+  firmware identification before flashing. Mass, exact ESC variant, voltage rating
+  and rating conditions remain unverified.
+- Planned flight firmware: **ArduCopter**, target `DAKEFPVH743`. Official support
+  exists for this board family; no firmware has been selected or tested on this aircraft.
+  [Board documentation](https://ardupilot.org/plane/docs/common-dakefpvh743pro.html)
+  and [standard H743 firmware](https://firmware.ardupilot.org/Copter/stable/DAKEFPVH743/).
 - Planned onboard computer: **Raspberry Pi 5 with 8 GB RAM**, confirmed by the user.
   Mass, regulator, cooling, storage, and mounting hardware are not yet specified.
 

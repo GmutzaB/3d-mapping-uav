@@ -1,5 +1,26 @@
 # 3D Mapping UAV
 
+One repository for the aircraft hardware, simulation, supporting software setup, and
+future autonomous 3D mapping integration. The goal is indoor and outdoor autonomous
+navigation and mapping; the current executable code is the airflow demonstration below.
+
+## Project guide
+
+- [Hardware and mass budget](HARDWARE.md)
+- [Proposed system architecture](docs/ARCHITECTURE.md)
+- [Integration roadmap](docs/ROADMAP.md)
+- [Setup and dependency management](setup/README.md)
+- [Software dependency inventory](setup/dependencies.json) — proposed, not a tested lockfile
+- [Configuration](config/README.md)
+- [Custom software](src/README.md)
+- [Simulation](simulation/README.md)
+- [Experiment data](data/README.md)
+
+Existing simulation scripts remain at the root so current commands and debugger settings
+continue to work. Supporting robotics packages are not installed by this scaffold.
+
+## Airflow demonstration
+
 Python propeller estimate and 2D incompressible Navier–Stokes airflow demo. Later work can cover aircraft dynamics, sensors, and 3D mapping.
 
 ## Setup (VS Code)

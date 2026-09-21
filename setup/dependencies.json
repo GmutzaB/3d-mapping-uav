@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "description": "Planning inventory; null versions are unresolved, not tested pins.",
+  "dependencies": [
+    {
+      "name": "arducopter",
+      "selection": "planned",
+      "role": "DAKEFPVH743 flight firmware",
+      "source": "https://firmware.ardupilot.org/Copter/stable/DAKEFPVH743/",
+      "version": null,
+      "validation": "unverified",
+      "platform": null,
+      "evidence": null,
+      "notes": "Confirm physical revision before choosing a firmware release."
+    },
+    {
+      "name": "unilidar_sdk2",
+      "selection": "planned",
+      "role": "L2 point cloud and IMU driver",
+      "source": "https://github.com/unitreerobotics/unilidar_sdk2",
+      "version": null,
+      "validation": "unverified",
+      "platform": null,
+      "evidence": null,
+      "notes": "Vendor provides ROS 1 and ROS 2 wrappers; project platform untested."
+    },
+    {
+      "name": "ros2",
+      "selection": "candidate",
+      "role": "Companion middleware",
+      "source": "https://docs.ros.org/",
+      "version": null,
+      "validation": "unverified",
+      "platform": null,
+      "evidence": null,
+      "notes": "Distribution and OS depend on selected mapping implementation."
+    },
+    {
+      "name": "point_lio_unilidar",
+      "selection": "candidate",
+      "role": "LiDAR inertial mapping",
+      "source": "https://github.com/unitreerobotics/point_lio_unilidar",
+      "version": null,
+      "validation": "unverified",
+      "platform": null,
+      "evidence": null,
+      "notes": "Vendor instructions target ROS 1 Noetic; not a verified ROS 2 stack."
+    },
+    {
+      "name": "fast_lio",
+      "selection": "candidate",
+      "role": "Alternative LiDAR inertial mapping",
+      "source": "https://github.com/hku-mars/FAST_LIO",
+      "version": null,
+      "validation": "unverified",
+      "platform": null,
+      "evidence": null,
+      "notes": "L2 adaptation and selected ROS version require evaluation."
+    },
+    {
+      "name": "ego_planner",
+      "selection": "candidate",
+      "role": "Local trajectory planning",
+      "source": "https://github.com/ZJU-FAST-Lab/ego-planner",
+      "version": null,
+      "validation": "unverified",
+      "platform": null,
+      "evidence": null,
+      "notes": "Research integration; choose compatible branch and map representation."
+    },
+    {
+      "name": "fuel",
+      "selection": "candidate",
+      "role": "Self-directed exploration",
+      "source": "https://github.com/HKUST-Aerial-Robotics/FUEL",
+      "version": null,
+      "validation": "unverified",
+      "platform": null,
+      "evidence": null,
+      "notes": "Only needed if exploration becomes part of the selected scope."
+    },
+    {
+      "name": "octomap",
+      "selection": "candidate",
+      "role": "3D occupancy representation",
+      "source": "https://octomap.github.io/",
+      "version": null,
+      "validation": "unverified",
+      "platform": null,
+      "evidence": null,
+      "notes": "May be unnecessary if selected planner provides its own map."
+    },
+    {
+      "name": "ardupilot_gazebo",
+      "selection": "planned",
+      "role": "Flight simulation integration",
+      "source": "https://github.com/ArduPilot/ardupilot_gazebo",
+      "version": null,
+      "validation": "unverified",
+      "platform": null,
+      "evidence": null,
+      "notes": "Select matching Gazebo and ArduPilot versions."
+    },
+    {
+      "name": "qgroundcontrol",
+      "selection": "planned",
+      "role": "Ground control application",
+      "source": "https://qgroundcontrol.com/",
+      "version": null,
+      "validation": "unverified",
+      "platform": null,
+      "evidence": null,
+      "notes": "Record tested release and host platform."
+    },
+    {
+      "name": "cloudcompare",
+      "selection": "planned",
+      "role": "Map inspection and processing",
+      "source": "https://www.cloudcompare.org/",
+      "version": null,
+      "validation": "unverified",
+      "platform": null,
+      "evidence": null,
+      "notes": "Record tested release and export workflow."
+    }
+  ]
+}
