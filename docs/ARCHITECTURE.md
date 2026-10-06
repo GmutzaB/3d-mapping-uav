@@ -6,8 +6,11 @@ Build a quadcopter that autonomously navigates and produces 3D maps indoors and 
 Whether missions use assigned destinations or self-directed exploration remains undecided.
 Seamless indoor/outdoor transitions are a separate requirement to evaluate.
 
-The current implementation is the Python airflow/thrust demonstration at the repository root.
-The autonomy pipeline below is proposed; it is not implemented or flight validated.
+The current implementation includes the Python airflow/thrust demonstration and the offline rigid-body model described in [FLIGHT_MODEL.md](FLIGHT_MODEL.md).
+See [CONNECTION_PLAN.md](CONNECTION_PLAN.md) for proposed interfaces and latest hardware uncertainty.
+Offline frame conversions, command gating and MAVLink encoding are now implemented
+in [src/companion](../src/README.md), with synthetic replay verification.
+The live autonomy pipeline below remains proposed and is not flight validated.
 
 ## Proposed responsibilities
 

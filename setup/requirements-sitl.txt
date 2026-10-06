@@ -1,0 +1,7 @@
+# Native ArduCopter 4.6.3 build helpers; companion runtime is separate.
+empy==3.3.4
+pexpect==4.9.0
+ptyprocess==0.7.0
+# DroneCAN still imports pkg_resources (removed in newer setuptools).
+setuptools==80.9.0
+pyserial==3.5

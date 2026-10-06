@@ -16,13 +16,13 @@ or 5.3955 N per rotor with equal loading (550 gram-force each).
 | Propellers | 4 | 6.6 g | 26.4 g |
 | Battery | 1 | 618 g | 618 g |
 | Unitree L2 4D LiDAR | 1 | 230 g | 230 g |
-| **Known subtotal** | | | **1061.2 g** |
+| **Subtotal including candidate L2** | | | **1061.2 g** |
 | **Remaining within 2200 g target** | | | **1138.8 g** |
 
 The remaining allowance must cover the frame, ESCs, flight controller, receiver,
 other sensors, any companion computer, power distribution/regulators, additional wiring,
 mounts, landing gear, and fasteners. Avoid counting the included motor cables twice.
-The known components already exceed the earlier hoped-for 1 kg total.
+The listed components including candidate L2 already exceed the earlier hoped-for 1 kg total.
 The 2.2 kg value remains a target until the remaining components are weighed.
 The user is investigating mounting compatibility and the lack of combination thrust data.
 
@@ -59,7 +59,7 @@ Mass: **618 g**, supplied by the user. Exact model is unknown.
 
 ## Mapping payload
 
-**Unitree L2 4D LiDAR**, confirmed by the user. Mass: **230 g**, supplied by the user.
+**Unitree L2 4D LiDAR**, a candidate under consideration (updated September 28, 2026). Mass: **230 g**, supplied by the user.
 Power requirements, data interface details, and mounting hardware mass have not yet
 been verified for the connection plan.
 
@@ -84,8 +84,19 @@ Use `--mass-kg 2.2` with either simulation script to change the total mass assum
   exists for this board family; no firmware has been selected or tested on this aircraft.
   [Board documentation](https://ardupilot.org/plane/docs/common-dakefpvh743pro.html)
   and [standard H743 firmware](https://firmware.ardupilot.org/Copter/stable/DAKEFPVH743/).
-- Planned onboard computer: **Raspberry Pi 5 with 8 GB RAM**, confirmed by the user.
+- Owned onboard computer: **Raspberry Pi 5**, purchase confirmed September 28, 2026. Earlier notes listed 8 GB RAM; capacity needs confirmation.
   Mass, regulator, cooling, storage, and mounting hardware are not yet specified.
 
 These items are part of the 2.2 kg total allowance, not additional mass on top of it.
 Their unknown weights have not been added to the known subtotal. Electrical compatibility and onboard computer power consumption have not yet been verified.
+
+## Latest user clarification — September 28, 2026
+
+The project is being built from the ground up. The owned electronics are an STM H743
+flight controller with a 55A ESC stack; the exact manufacturer/revision still needs
+confirmation against the earlier DAKEFPV identification. Earlier firmware-target
+notes above remain provisional. The onboard computer is an owned Raspberry Pi 5 (purchase confirmed in the follow-up);
+RAM capacity remains unconfirmed. Unitree L2 is a candidate, not a final sensor
+choice. The frame is tentatively to be printed in a polycarbonate/nylon material;
+exact material, geometry, print process, mass and structural properties are unresolved.
+The 230 g LiDAR allowance depends on selecting L2.

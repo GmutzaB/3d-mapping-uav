@@ -28,3 +28,15 @@ flight duration; operational boundaries; and completion/return criteria.
 Record repository commit, hardware revision, OS/ROS versions, dependency revisions,
 configuration used, procedure, expected result, measured result and limitations.
 Link large datasets externally using the guidance in `../data/README.md`.
+
+## September 28 software increment
+
+- [x] Add offline rigid-body dynamics and analytical unit tests.
+- [x] Draft connection contracts and AI feasibility / May 2027 delivery plan.
+- [ ] Confirm exact May deadline and measurable demonstration requirements.
+
+See [delivery plan](AI_AND_DELIVERY_PLAN.md) and [connection plan](CONNECTION_PLAN.md).
+
+- [x] Verify companion frame conversions, latched command gating and MAVLink wire encoding.
+- [x] Exercise synthetic planner/localization loss and operator recovery in offline replay.
+- [ ] Verify the same scenarios against an actual ArduPilot SITL instance.

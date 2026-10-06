@@ -2,9 +2,13 @@
 
 One repository for the aircraft hardware, simulation, supporting software setup, and
 future autonomous 3D mapping integration. The goal is indoor and outdoor autonomous
-navigation and mapping; the current executable code is the airflow demonstration below.
+navigation and mapping; the executable code includes the airflow demonstration and an offline rigid-body aircraft model.
 
 ## Project guide
+
+- [Connection and communication plan](docs/CONNECTION_PLAN.md)
+- [Aircraft flight dynamics model](docs/FLIGHT_MODEL.md)
+- [AI feasibility and May delivery plan](docs/AI_AND_DELIVERY_PLAN.md)
 
 - [Hardware and mass budget](HARDWARE.md)
 - [Proposed system architecture](docs/ARCHITECTURE.md)
@@ -12,7 +16,7 @@ navigation and mapping; the current executable code is the airflow demonstration
 - [Setup and dependency management](setup/README.md)
 - [Software dependency inventory](setup/dependencies.json) — proposed, not a tested lockfile
 - [Configuration](config/README.md)
-- [Custom software](src/README.md)
+- [Companion software and offline communication replay](src/README.md)
 - [Simulation](simulation/README.md)
 - [Experiment data](data/README.md)
 
@@ -111,3 +115,24 @@ See [HARDWARE.md](HARDWARE.md) for the supplied motor and two-blade 7×4.5 prope
 specifications and unresolved mounting details. `--mass-kg` defaults to 2.2 kg total
 takeoff mass. The thrust chart shows the corresponding hover target; the summary saves
 total and per-motor required thrust. This does not validate the estimated thrust curve.
+
+## Share a flight-model visual
+
+In VS Code select **Flight model — shareable roll animation** under Run and Debug,
+then press F5. Or run `.venv/bin/python flight_dynamics.py --scenario roll --seconds 0.5`.
+Open `outputs/flight/roll.gif` for the animation or `roll.png` for a presentation image.
+The animation uses simulated data with provisional parameters; it is not recorded flight.
+Running `flight_dynamics.py` without arguments generates the stationary hover example.
+
+## Feedback-control demonstration
+
+Run `flight_control.py` or choose **Feedback control — comparison animation** in VS Code.
+See [controller experiment and results](docs/FEEDBACK_CONTROL.md) for the 10-second
+hover, 10° roll, return, disturbance recovery, side-by-side animation and SITL next steps.
+
+## ArduCopter SITL mission runner
+
+Run `.venv/bin/python sitl_mission.py` or select **SITL mission — takeoff, hover,
+waypoint, land** in Run and Debug. The program launches its own local simulator
+and saves telemetry, acknowledgments, completion metrics, a chart and a GIF.
+See [build, run and acceptance criteria](setup/SITL.md).
