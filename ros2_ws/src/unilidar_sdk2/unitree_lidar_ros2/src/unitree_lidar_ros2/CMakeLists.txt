@@ -21,7 +21,6 @@ find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(PCL REQUIRED)
-find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(Threads REQUIRED)
@@ -48,7 +47,6 @@ set(_unitree_lidar_deps
   "${CMAKE_CURRENT_SOURCE_DIR}/../../../unitree_lidar_sdk/lib/${CMAKE_SYSTEM_PROCESSOR}/libunilidar_sdk2.a"
   Threads::Threads
   rclcpp::rclcpp
-  tf2::tf2
   tf2_ros::tf2_ros
   ${std_msgs_TARGETS}
   ${sensor_msgs_TARGETS}
