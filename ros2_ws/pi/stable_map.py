@@ -3,7 +3,7 @@
 
 The first cloud is the map. Each later cloud is pulled onto those surfaces
 (so a wall stays one wall) and only points that see new space are added.
-The lidar IMU supplies the turn between clouds.
+The last spin's pose is kept. The lidar IMU supplies only the turn since that spin.
 
 Leave the lidar launch running, then:
 
@@ -137,31 +137,47 @@ def correspondences(source, target, max_distance):
     return matched
 
 
+def heading_deg(rotation):
+    """Yaw of the lidar's forward axis in the map, in degrees."""
+    return float(np.degrees(np.arctan2(rotation[1, 0], rotation[0, 0])))
+
+
+def pose_guess(previous_rotation, imu_delta):
+    """Last ICP pose, plus this spin's IMU turn. Never an absolute IMU heading."""
+    if imu_delta is None:
+        return np.array(previous_rotation, dtype=np.float64, copy=True)
+    return previous_rotation @ imu_delta
+
+
 def align_scan(source, target, target_normals, rotation, translation, max_distance, iterations=8):
-    """Pull source onto the map planes. Returns pose, acceptance, and mean plane error."""
+    """Pull source onto the map planes. Returns pose, acceptance, and mean plane error.
+
+    The incoming rotation is only the starting guess. A strong match may replace
+    its yaw, and the returned rotation is the one that must be kept for the next spin.
+    """
     rotation = np.array(rotation, dtype=np.float64, copy=True)
     translation = np.array(translation, dtype=np.float64, copy=True)
-    usable = np.linalg.norm(target_normals, axis=1) > 0.5
-    if usable.sum() < MIN_PAIRS or len(source) < MIN_PAIRS:
+    target = np.asarray(target, dtype=np.float64)
+    target_normals = np.asarray(target_normals, dtype=np.float64)
+    if (np.linalg.norm(target_normals, axis=1) > 0.5).sum() < MIN_PAIRS or len(source) < MIN_PAIRS or len(target) < MIN_PAIRS:
         return rotation, translation, False, None
-    target = np.asarray(target, dtype=np.float64)[usable]
-    target_normals = np.asarray(target_normals, dtype=np.float64)[usable]
     chosen = stride_index(len(target), TARGET_CAP)
     target = target[chosen]
     target_normals = target_normals[chosen]
     source = np.asarray(source, dtype=np.float64)[stride_index(len(source), SOURCE_CAP)]
-    current_rotation = rotation.copy()
-    current_translation = translation.copy()
+    current_rotation, current_translation = _yaw_search(
+        source, target, rotation, translation, max_distance
+    )
     tight = max(0.08, min(0.12, max_distance * 0.35))
     for step in range(iterations):
         limit = max_distance if step < iterations // 2 else tight
         moved = apply_pose(current_rotation, current_translation, source)
         paired = correspondences(moved, target, limit)
-        keep = paired >= 0
-        if keep.sum() < MIN_PAIRS:
+        use = _with_normals(paired, target_normals)
+        if use.sum() < MIN_PAIRS:
             return rotation, translation, False, None
         delta_rotation, delta_translation, step_ok = _plane_step(
-            moved[keep], target[paired[keep]], target_normals[paired[keep]]
+            moved[use], target[paired[use]], target_normals[paired[use]]
         )
         if not step_ok:
             return rotation, translation, False, None
@@ -172,17 +188,69 @@ def align_scan(source, target, target_normals, rotation, translation, max_distan
     moved = apply_pose(current_rotation, current_translation, source)
     paired = correspondences(moved, target, tight)
     keep = paired >= 0
-    if keep.sum() < MIN_PAIRS or keep.sum() / len(source) < 0.35:
+    # Most of the sweep has to land on the map. A turned copy of the room matches
+    # only a wedge, and inserting the rest draws the room again at a new angle.
+    if keep.sum() < MIN_PAIRS or keep.sum() / len(source) < 0.55:
         return rotation, translation, False, None
-    residual = np.sum(target_normals[paired[keep]] * (moved[keep] - target[paired[keep]]), axis=1)
+    use = _with_normals(paired, target_normals)
+    if use.sum() < MIN_PAIRS:
+        return rotation, translation, False, None
+    residual = np.sum(target_normals[paired[use]] * (moved[use] - target[paired[use]]), axis=1)
     fit = float(np.median(np.abs(residual)))
     if fit > 0.03:
         return rotation, translation, False, fit
     return current_rotation, current_translation, True, fit
 
 
+def _with_normals(paired, normals):
+    use = paired >= 0
+    if not np.any(use):
+        return use
+    use = use.copy()
+    use[use] = np.linalg.norm(normals[paired[use]], axis=1) > 0.5
+    return use
+
+
+def _yaw_search(source, target, rotation, translation, max_distance):
+    """Pick the body yaw, around the prior, that lands on the same surfaces.
+
+    The gate is tight on purpose. A wide gate counts a point that merely reaches
+    some wall, so a square room scores just as well a quarter-turn off, and the
+    sweep is stored as another rotated copy.
+    """
+    gate = max(0.08, min(0.12, max_distance * 0.35))
+    probe_source = source[stride_index(len(source), 400)]
+    probe_target = target[stride_index(len(target), 800)]
+    best_rotation = rotation
+    best_score = _inlier_count(probe_source, probe_target, rotation, translation, gate)
+    best_offset = 0
+    for degrees in (-90, -60, -40, -25, -12, 12, 25, 40, 60, 90):
+        candidate = rotation @ _yaw_matrix(np.deg2rad(degrees))
+        score = _inlier_count(probe_source, probe_target, candidate, translation, gate)
+        closer = score == best_score and abs(degrees) < abs(best_offset)
+        if score > best_score or closer:
+            best_score = score
+            best_offset = degrees
+            best_rotation = candidate
+    return best_rotation, translation
+
+
+def _yaw_matrix(radians):
+    cosine, sine = np.cos(radians), np.sin(radians)
+    return np.array([[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]])
+
+
+def _inlier_count(source, target, rotation, translation, max_distance):
+    moved = apply_pose(rotation, translation, source)
+    return int((correspondences(moved, target, max_distance) >= 0).sum())
+
+
 def _plane_step(source, target, normals):
-    """Small rotation and translation that seats source on the target planes."""
+    """Small rotation and translation that seats source on the target planes.
+
+    Rotation is lightly damped so a strong match can correct a large yaw.
+    Translation is damped harder so a wall cannot slide along itself.
+    """
     delta = target - source
     axes = np.cross(source, normals)
     design = np.concatenate((axes, normals), axis=1)
@@ -191,13 +259,19 @@ def _plane_step(source, target, normals):
     load = design.T @ slope
     diag = np.diag(system).copy()
     diag[diag < 1e-6] = 1e-6
-    system.flat[::7] += 0.08 * diag
+    system.flat[::7] += np.array([0.01, 0.01, 0.01, 0.25, 0.25, 0.25]) * diag
     try:
         update = np.linalg.solve(system, load)
     except np.linalg.LinAlgError:
         return np.eye(3), np.zeros(3), False
-    if not np.all(np.isfinite(update)) or np.linalg.norm(update[3:]) > 0.5 or np.linalg.norm(update[:3]) > 0.5:
+    if not np.all(np.isfinite(update)):
         return np.eye(3), np.zeros(3), False
+    turn = np.linalg.norm(update[:3])
+    shift = np.linalg.norm(update[3:])
+    if turn > 0.35:
+        update[:3] *= 0.35 / turn
+    if shift > 0.2:
+        update[3:] *= 0.2 / shift
     return rodrigues(update[:3]), update[3:], True
 
 
@@ -366,7 +440,13 @@ class Tracker:
             self.map.insert(xyz, intensity, normals)
             self.last_fit = 0.0
             return "seed"
-        guess_rotation = self.rotation if rotation_hint is None else np.asarray(rotation_hint, dtype=np.float64)
+        # rotation_hint is the IMU turn since the last good spin, in the body
+        # frame. It is applied on top of that spin. Substituting an absolute IMU
+        # heading here would throw away the yaw just found and draw the room again.
+        if rotation_hint is None:
+            guess_rotation = np.array(self.rotation, dtype=np.float64, copy=True)
+        else:
+            guess_rotation = pose_guess(self.rotation, rotation_hint)
         rotation, translation, ok, fit = align_scan(
             xyz, self.map.xyz(), self.map.normals(),
             guess_rotation, self.translation, self.max_correspondence,
@@ -442,20 +522,20 @@ def collect(seconds_between_saves, topic, imu_topic, output, voxel, max_correspo
                 )
                 intensity = np.ones(len(xyz))
             stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-            hint = None
+            delta = None
             if last_stamp is not None:
                 delta = imu.rotation_since(last_stamp, stamp)
-                if delta is not None:
-                    hint = tracker.rotation @ delta
-            status = tracker.add_scan(xyz, intensity, rotation_hint=hint)
+            status = tracker.add_scan(xyz, intensity, rotation_hint=delta)
             if status != "skipped":
                 last_stamp = stamp
             counts[status] += 1
             place = tracker.translation
             fit = "  --" if tracker.last_fit is None else f"{tracker.last_fit * 100:4.1f}cm"
+            dimu = "  --" if delta is None else f"{heading_deg(delta):5.1f}°"
             print(
                 f"{status}: map {len(tracker.map)} points, "
                 f"lidar at {place[0]:.2f} {place[1]:.2f} {place[2]:.2f} m, "
+                f"yaw={heading_deg(tracker.rotation):5.1f}° dIMU={dimu}, "
                 f"wall fit {fit}, imu {'on' if len(imu.samples) >= 2 else 'off'}, "
                 f"aligned {counts['aligned']}, skipped {counts['skipped']}",
                 flush=True,
