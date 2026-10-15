@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """Build a map that stays put while the lidar moves.
 
-The first cloud defines the map. Each later cloud is aligned to that map and
-only empty voxels receive new points, so points already stored are not moved.
-Stop with Ctrl-C. The latest map is rewritten to ~/map.pcd while this runs.
+The first cloud is the map. Each later cloud is pulled onto those surfaces
+(so a wall stays one wall) and only points that see new space are added.
+The lidar IMU supplies the turn between clouds.
 
 Leave the lidar launch running, then:
 
     python3 ros2_ws/pi/stable_map.py
 
-Move slowly enough that each sweep still overlaps the map. A sweep that cannot
-be aligned is skipped instead of dragging the old points with it.
+Walk slowly. Ctrl-C stops. ~/map.pcd is rewritten every few seconds.
 """
 
 import argparse
@@ -63,52 +62,69 @@ def voxel_downsample(xyz, intensity, voxel):
     return xyz[index], intensity[index]
 
 
-def stride(points, limit):
-    if len(points) <= limit:
-        return points
-    step = int(np.ceil(len(points) / limit))
-    return points[::step]
+def stride_index(count, limit):
+    if count <= limit:
+        return np.arange(count)
+    step = int(np.ceil(count / limit))
+    return np.arange(0, count, step)
 
 
-def rigid_transform(src, dst):
-    """Rotation and translation that map src onto dst. Both are Nx3."""
-    src = np.asarray(src, dtype=np.float64)
-    dst = np.asarray(dst, dtype=np.float64)
-    src_center = src.mean(axis=0)
-    dst_center = dst.mean(axis=0)
-    covariance = (src - src_center).T @ (dst - dst_center)
-    left, _, vh = np.linalg.svd(covariance)
-    rotation = vh.T @ left.T
-    if np.linalg.det(rotation) < 0:
-        vh = vh.copy()
-        vh[-1] *= -1
-        rotation = vh.T @ left.T
-    translation = dst_center - rotation @ src_center
-    return rotation, translation
+def rodrigues(rotvec):
+    angle = np.linalg.norm(rotvec)
+    if angle < 1e-12:
+        return np.eye(3)
+    axis = rotvec / angle
+    x, y, z = axis
+    skew = np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]])
+    return np.eye(3) + np.sin(angle) * skew + (1 - np.cos(angle)) * (skew @ skew)
 
 
 def apply_pose(rotation, translation, xyz):
     return (rotation @ np.asarray(xyz, dtype=np.float64).T).T + translation
 
 
-def predict_pose(older_rotation, older_translation, rotation, translation):
-    """Constant-velocity guess. With one previous pose, assume it stayed still."""
-    if older_rotation is None:
-        return rotation.copy(), translation.copy()
-    inverse_rotation = older_rotation.T
-    inverse_translation = -inverse_rotation @ older_translation
-    delta_rotation = rotation @ inverse_rotation
-    delta_translation = rotation @ inverse_translation + translation
-    return delta_rotation @ rotation, delta_rotation @ translation + delta_translation
+def estimate_normals(xyz, radius=0.3):
+    """Outward-facing plane normals. Rows are zero where the neighborhood is not flat."""
+    xyz = np.asarray(xyz, dtype=np.float64)
+    normals = np.zeros((len(xyz), 3))
+    if len(xyz) < 8:
+        return normals
+    voxel = radius / 2
+    keys = np.floor(xyz / voxel).astype(np.int64)
+    buckets = {}
+    for index, key in enumerate(map(tuple, keys.tolist())):
+        buckets.setdefault(key, []).append(index)
+    offsets = [(a, b, c) for a in (-1, 0, 1) for b in (-1, 0, 1) for c in (-1, 0, 1)]
+    for key, members in buckets.items():
+        neighbors = []
+        for offset in offsets:
+            neighbors.extend(buckets.get((key[0] + offset[0], key[1] + offset[1], key[2] + offset[2]), ()))
+        if len(neighbors) < 6:
+            continue
+        pts = xyz[neighbors]
+        _center, cov = _covariance(pts)
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        if eigvals[1] < 1e-8 or eigvals[0] / eigvals[1] > 0.35:
+            continue
+        normal = eigvecs[:, 0]
+        if normal @ pts.mean(axis=0) > 0:
+            normal = -normal
+        normals[members] = normal
+    return normals
+
+
+def _covariance(pts):
+    center = pts.mean(axis=0)
+    shifted = pts - center
+    return center, (shifted.T @ shifted) / len(pts)
 
 
 def correspondences(source, target, max_distance):
-    """Pairs of source points and their nearest target point within max_distance."""
+    """Nearest target index for each source point inside max_distance. -1 if none."""
+    matched = np.full(len(source), -1, dtype=np.int64)
     if len(source) == 0 or len(target) == 0:
-        return np.empty((0, 3)), np.empty((0, 3))
+        return matched
     limit = max_distance * max_distance
-    matched_source = []
-    matched_target = []
     chunk = 250
     for start in range(0, len(source), chunk):
         block = source[start:start + chunk]
@@ -116,50 +132,92 @@ def correspondences(source, target, max_distance):
         nearest = np.argmin(distance_sq, axis=1)
         best = distance_sq[np.arange(len(block)), nearest]
         keep = best <= limit
-        if np.any(keep):
-            matched_source.append(block[keep])
-            matched_target.append(target[nearest[keep]])
-    if not matched_source:
-        return np.empty((0, 3)), np.empty((0, 3))
-    return np.vstack(matched_source), np.vstack(matched_target)
+        rows = np.arange(start, start + len(block))[keep]
+        matched[rows] = nearest[keep]
+    return matched
 
 
-def align_scan(source, target, rotation, translation, max_distance, iterations=8):
-    """Align source (lidar frame) to target (map frame). Returns pose and whether it held."""
-    if len(source) < MIN_PAIRS or len(target) < MIN_PAIRS:
-        return rotation, translation, False
-    current_rotation = np.array(rotation, dtype=np.float64, copy=True)
-    current_translation = np.array(translation, dtype=np.float64, copy=True)
-    source = stride(np.asarray(source, dtype=np.float64), SOURCE_CAP)
-    target = stride(np.asarray(target, dtype=np.float64), TARGET_CAP)
-    tight = max(0.12, max_distance * 0.35)
+def align_scan(source, target, target_normals, rotation, translation, max_distance, iterations=8):
+    """Pull source onto the map planes. Returns pose, acceptance, and mean plane error."""
+    rotation = np.array(rotation, dtype=np.float64, copy=True)
+    translation = np.array(translation, dtype=np.float64, copy=True)
+    usable = np.linalg.norm(target_normals, axis=1) > 0.5
+    if usable.sum() < MIN_PAIRS or len(source) < MIN_PAIRS:
+        return rotation, translation, False, None
+    target = np.asarray(target, dtype=np.float64)[usable]
+    target_normals = np.asarray(target_normals, dtype=np.float64)[usable]
+    chosen = stride_index(len(target), TARGET_CAP)
+    target = target[chosen]
+    target_normals = target_normals[chosen]
+    source = np.asarray(source, dtype=np.float64)[stride_index(len(source), SOURCE_CAP)]
+    current_rotation = rotation.copy()
+    current_translation = translation.copy()
+    tight = max(0.08, min(0.12, max_distance * 0.35))
     for step in range(iterations):
         limit = max_distance if step < iterations // 2 else tight
         moved = apply_pose(current_rotation, current_translation, source)
-        paired_source, paired_target = correspondences(moved, target, limit)
-        if len(paired_source) < MIN_PAIRS:
-            return rotation, translation, False
-        delta_rotation, delta_translation = rigid_transform(paired_source, paired_target)
+        paired = correspondences(moved, target, limit)
+        keep = paired >= 0
+        if keep.sum() < MIN_PAIRS:
+            return rotation, translation, False, None
+        delta_rotation, delta_translation, step_ok = _plane_step(
+            moved[keep], target[paired[keep]], target_normals[paired[keep]]
+        )
+        if not step_ok:
+            return rotation, translation, False, None
         current_rotation = delta_rotation @ current_rotation
         current_translation = delta_rotation @ current_translation + delta_translation
-        if np.linalg.norm(delta_translation) < 1e-3 and np.linalg.norm(delta_rotation - np.eye(3)) < 1e-3:
+        if np.linalg.norm(delta_translation) < 1e-3 and _rotation_angle(delta_rotation) < 1e-3:
             break
     moved = apply_pose(current_rotation, current_translation, source)
-    paired_source, _paired_target = correspondences(moved, target, tight)
-    if len(paired_source) < MIN_PAIRS or len(paired_source) / len(source) < 0.3:
-        return rotation, translation, False
-    return current_rotation, current_translation, True
+    paired = correspondences(moved, target, tight)
+    keep = paired >= 0
+    if keep.sum() < MIN_PAIRS or keep.sum() / len(source) < 0.35:
+        return rotation, translation, False, None
+    residual = np.sum(target_normals[paired[keep]] * (moved[keep] - target[paired[keep]]), axis=1)
+    fit = float(np.median(np.abs(residual)))
+    if fit > 0.03:
+        return rotation, translation, False, fit
+    return current_rotation, current_translation, True, fit
+
+
+def _plane_step(source, target, normals):
+    """Small rotation and translation that seats source on the target planes."""
+    delta = target - source
+    axes = np.cross(source, normals)
+    design = np.concatenate((axes, normals), axis=1)
+    slope = np.einsum("ni,ni->n", normals, delta)
+    system = design.T @ design
+    load = design.T @ slope
+    diag = np.diag(system).copy()
+    diag[diag < 1e-6] = 1e-6
+    system.flat[::7] += 0.08 * diag
+    try:
+        update = np.linalg.solve(system, load)
+    except np.linalg.LinAlgError:
+        return np.eye(3), np.zeros(3), False
+    if not np.all(np.isfinite(update)) or np.linalg.norm(update[3:]) > 0.5 or np.linalg.norm(update[:3]) > 0.5:
+        return np.eye(3), np.zeros(3), False
+    return rodrigues(update[:3]), update[3:], True
+
+
+def _rotation_angle(rotation):
+    cosine = np.clip((np.trace(rotation) - 1) * 0.5, -1, 1)
+    return float(np.arccos(cosine))
 
 
 class StableMap:
-    """Voxel map. The first point to claim a voxel is kept permanently."""
+    """Voxel map. The first point to claim a voxel is kept, and nearby points are not layered on it."""
 
     def __init__(self, voxel):
         self.voxel = float(voxel)
+        self.gate = max(self.voxel * 2.5, 0.05)
         self.occupied = set()
+        self._bins = {}
         self._capacity = 0
         self._count = 0
         self._points = np.empty((0, 4), dtype=np.float32)
+        self._normals = np.empty((0, 3), dtype=np.float32)
 
     def __len__(self):
         return self._count
@@ -170,9 +228,38 @@ class StableMap:
     def xyz(self):
         return np.asarray(self._points[:self._count, :3], dtype=np.float64)
 
-    def insert(self, xyz, intensity):
+    def normals(self):
+        return np.asarray(self._normals[:self._count], dtype=np.float64)
+
+    def novel_mask(self, xyz):
+        """True for points that are not already sitting on a stored surface."""
+        xyz = np.asarray(xyz, dtype=np.float64)
+        mask = np.ones(len(xyz), dtype=bool)
+        if self._count == 0 or len(xyz) == 0:
+            return mask
+        limit = self.gate * self.gate
+        keys = np.floor(xyz / self.gate).astype(np.int64)
+        offsets = [(a, b, c) for a in (-1, 0, 1) for b in (-1, 0, 1) for c in (-1, 0, 1)]
+        stored = self._points[:self._count, :3]
+        for index, key in enumerate(keys.tolist()):
+            best = limit + 1
+            for offset in offsets:
+                for stored_index in self._bins.get(
+                    (key[0] + offset[0], key[1] + offset[1], key[2] + offset[2]), ()
+                ):
+                    gap = xyz[index] - stored[stored_index]
+                    dist = float(gap @ gap)
+                    if dist < best:
+                        best = dist
+            mask[index] = best > limit
+        return mask
+
+    def insert(self, xyz, intensity, normals=None):
         xyz = np.asarray(xyz, dtype=np.float64)
         intensity = np.asarray(intensity, dtype=np.float64)
+        if normals is None:
+            normals = np.zeros((len(xyz), 3))
+        normals = np.asarray(normals, dtype=np.float64)
         if len(xyz) == 0:
             return 0
         keys = np.floor(xyz / self.voxel).astype(np.int64)
@@ -186,35 +273,85 @@ class StableMap:
             return 0
         chosen = np.asarray(keep, dtype=np.int64)
         block = np.column_stack((xyz[chosen], intensity[chosen])).astype(np.float32)
-        self._append(block)
+        normal_block = normals[chosen].astype(np.float32)
+        start = self._count
+        self._append(block, normal_block)
+        for offset, point in enumerate(block):
+            bin_key = tuple(np.floor(point[:3] / self.gate).astype(int))
+            self._bins.setdefault(bin_key, []).append(start + offset)
         return len(block)
 
-    def _append(self, block):
+    def _append(self, block, normals):
         count = self._count
         need = count + len(block)
         if need > self._capacity:
             self._capacity = max(need, self._capacity * 2, 1024)
             grown = np.empty((self._capacity, 4), dtype=np.float32)
+            grown_normals = np.empty((self._capacity, 3), dtype=np.float32)
             if count:
                 grown[:count] = self._points[:count]
+                grown_normals[:count] = self._normals[:count]
             self._points = grown
+            self._normals = grown_normals
         self._points[count:need] = block
+        self._normals[count:need] = normals
         self._count = need
 
 
-class Tracker:
-    """Align each sweep to the map, then add only voxels that are still empty."""
+class ImuTrack:
+    """Gyro samples used to guess how far the lidar turned between clouds."""
 
-    def __init__(self, voxel=0.03, max_correspondence=0.45):
+    def __init__(self):
+        self.samples = []
+
+    def push(self, stamp, gyro):
+        gyro = np.asarray(gyro, dtype=np.float64)
+        if gyro.shape != (3,) or not np.all(np.isfinite(gyro)):
+            return
+        self.samples.append((float(stamp), gyro))
+        cutoff = float(stamp) - 2.0
+        while len(self.samples) > 2 and self.samples[0][0] < cutoff:
+            self.samples.pop(0)
+
+    def rotation_since(self, start, end):
+        """Rotation of the sensor body from start to end, or None if the gap has no gyro."""
+        if not self.samples or end < start:
+            return None
+        window = [sample for sample in self.samples if start - 0.05 <= sample[0] <= end + 0.05]
+        if len(window) < 2 or window[-1][0] - window[0][0] < 0.5 * (end - start):
+            return None
+        rotation = np.eye(3)
+        previous_time = start
+        rate = window[0][1]
+        for stamp, gyro in window:
+            if stamp < start:
+                rate = gyro
+                continue
+            if stamp > end:
+                break
+            step = stamp - previous_time
+            if step > 0:
+                rotation = rotation @ rodrigues(rate * step)
+            previous_time = stamp
+            rate = gyro
+        tail = end - previous_time
+        if tail > 0:
+            rotation = rotation @ rodrigues(rate * tail)
+        return rotation
+
+
+class Tracker:
+    """Align each sweep to the map planes, then add only points that see new space."""
+
+    def __init__(self, voxel=0.02, max_correspondence=0.4):
         self.voxel = float(voxel)
         self.max_correspondence = float(max_correspondence)
         self.map = StableMap(self.voxel)
         self.rotation = np.eye(3)
         self.translation = np.zeros(3)
-        self._older_rotation = None
-        self._older_translation = None
+        self.last_fit = None
 
-    def add_scan(self, xyz, intensity=None):
+    def add_scan(self, xyz, intensity=None, rotation_hint=None):
         xyz = np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
         if intensity is None:
             intensity = np.ones(len(xyz), dtype=np.float64)
@@ -224,44 +361,56 @@ class Tracker:
         xyz, intensity = voxel_downsample(xyz[finite], intensity[finite], self.voxel)
         if len(xyz) == 0:
             return "skipped"
+        normals = estimate_normals(xyz)
         if len(self.map) == 0:
-            self.map.insert(xyz, intensity)
+            self.map.insert(xyz, intensity, normals)
+            self.last_fit = 0.0
             return "seed"
-        guess_rotation, guess_translation = predict_pose(
-            self._older_rotation, self._older_translation, self.rotation, self.translation
+        guess_rotation = self.rotation if rotation_hint is None else np.asarray(rotation_hint, dtype=np.float64)
+        rotation, translation, ok, fit = align_scan(
+            xyz, self.map.xyz(), self.map.normals(),
+            guess_rotation, self.translation, self.max_correspondence,
         )
-        rotation, translation, ok = align_scan(
-            xyz, self.map.xyz(), guess_rotation, guess_translation, self.max_correspondence
-        )
+        self.last_fit = fit
         if not ok:
             return "skipped"
-        self._older_rotation = self.rotation
-        self._older_translation = self.translation.copy()
+        moved = apply_pose(rotation, translation, xyz)
+        moved_normals = (rotation @ normals.T).T
+        fresh = self.map.novel_mask(moved)
         self.rotation = rotation
         self.translation = translation
-        self.map.insert(apply_pose(rotation, translation, xyz), intensity)
+        self.map.insert(moved[fresh], intensity[fresh], moved_normals[fresh])
         return "aligned"
 
 
-def collect(seconds_between_saves, topic, output, voxel, max_correspondence):
+def collect(seconds_between_saves, topic, imu_topic, output, voxel, max_correspondence):
     import rclpy
     from rclpy.qos import qos_profile_sensor_data
-    from sensor_msgs.msg import PointCloud2
+    from sensor_msgs.msg import Imu, PointCloud2
     from sensor_msgs_py import point_cloud2
 
     rclpy.init()
     node = rclpy.create_node("stable_map")
     tracker = Tracker(voxel, max_correspondence)
+    imu = ImuTrack()
     pending = {}
     last_save = time.monotonic()
+    last_stamp = None
     counts = {"seed": 0, "aligned": 0, "skipped": 0}
 
     def on_cloud(msg: PointCloud2) -> None:
         pending["msg"] = msg
 
+    def on_imu(msg: Imu) -> None:
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        imu.push(stamp, [
+            msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z
+        ])
+
     node.create_subscription(PointCloud2, topic, on_cloud, qos_profile_sensor_data)
+    node.create_subscription(Imu, imu_topic, on_imu, qos_profile_sensor_data)
     print(
-        f"mapping {topic} into {output} at {voxel:.2f} m voxels — move the lidar slowly",
+        f"mapping {topic} into {output} at {voxel * 100:.0f} cm voxels — walk slowly",
         flush=True,
     )
 
@@ -276,27 +425,41 @@ def collect(seconds_between_saves, topic, output, voxel, max_correspondence):
         while rclpy.ok():
             rclpy.spin_once(node, timeout_sec=0.2)
             msg = pending.pop("msg", None)
-            if msg is not None:
-                try:
-                    points = point_cloud2.read_points(
-                        msg, field_names=["x", "y", "z", "intensity"], skip_nans=True
-                    )
-                    xyz = np.column_stack((points["x"], points["y"], points["z"]))
-                    intensity = np.asarray(points["intensity"], dtype=np.float64)
-                except (AssertionError, ValueError):
-                    xyz = point_cloud2.read_points_numpy(
-                        msg, field_names=["x", "y", "z"], skip_nans=True
-                    )
-                    intensity = np.ones(len(xyz))
-                status = tracker.add_scan(xyz, intensity)
-                counts[status] += 1
-                place = tracker.translation
-                print(
-                    f"{status}: map {len(tracker.map)} points, "
-                    f"lidar at {place[0]:.2f} {place[1]:.2f} {place[2]:.2f} m, "
-                    f"aligned {counts['aligned']}, skipped {counts['skipped']}",
-                    flush=True,
+            if msg is None:
+                if tracker.map and time.monotonic() - last_save >= seconds_between_saves:
+                    save()
+                    last_save = time.monotonic()
+                continue
+            try:
+                points = point_cloud2.read_points(
+                    msg, field_names=["x", "y", "z", "intensity"], skip_nans=True
                 )
+                xyz = np.column_stack((points["x"], points["y"], points["z"]))
+                intensity = np.asarray(points["intensity"], dtype=np.float64)
+            except (AssertionError, ValueError):
+                xyz = point_cloud2.read_points_numpy(
+                    msg, field_names=["x", "y", "z"], skip_nans=True
+                )
+                intensity = np.ones(len(xyz))
+            stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+            hint = None
+            if last_stamp is not None:
+                delta = imu.rotation_since(last_stamp, stamp)
+                if delta is not None:
+                    hint = tracker.rotation @ delta
+            status = tracker.add_scan(xyz, intensity, rotation_hint=hint)
+            if status != "skipped":
+                last_stamp = stamp
+            counts[status] += 1
+            place = tracker.translation
+            fit = "  --" if tracker.last_fit is None else f"{tracker.last_fit * 100:4.1f}cm"
+            print(
+                f"{status}: map {len(tracker.map)} points, "
+                f"lidar at {place[0]:.2f} {place[1]:.2f} {place[2]:.2f} m, "
+                f"wall fit {fit}, imu {'on' if len(imu.samples) >= 2 else 'off'}, "
+                f"aligned {counts['aligned']}, skipped {counts['skipped']}",
+                flush=True,
+            )
             if tracker.map and time.monotonic() - last_save >= seconds_between_saves:
                 save()
                 last_save = time.monotonic()
@@ -311,13 +474,14 @@ def collect(seconds_between_saves, topic, output, voxel, max_correspondence):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--topic", default="/unilidar/cloud")
+    parser.add_argument("--imu-topic", default="/unilidar/imu")
     parser.add_argument("--output", default=str(Path.home() / "map.pcd"))
-    parser.add_argument("--voxel", type=float, default=0.03, help="map cell size in meters")
+    parser.add_argument("--voxel", type=float, default=0.02, help="map cell size in meters")
     parser.add_argument(
         "--max-correspondence",
         type=float,
-        default=0.45,
-        help="farthest a new point may be from the map and still count as the same surface",
+        default=0.4,
+        help="how far a new sweep may start from the map and still be pulled onto it",
     )
     parser.add_argument("--save-every", type=float, default=5.0, help="seconds between PCD writes")
     args = parser.parse_args()
@@ -326,6 +490,7 @@ def main():
     collect(
         args.save_every,
         args.topic,
+        args.imu_topic,
         Path(args.output).expanduser(),
         args.voxel,
         args.max_correspondence,
