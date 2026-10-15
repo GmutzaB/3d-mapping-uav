@@ -17,6 +17,7 @@ navigation and mapping; the executable code includes the airflow demonstration a
 - [Software dependency inventory](setup/dependencies.json) — proposed, not a tested lockfile
 - [Configuration](config/README.md)
 - [Companion software and offline communication replay](src/README.md)
+- [ROS 2 on the Raspberry Pi 5: L2 LiDAR, MAVROS, obstacle sectors](ros2_ws/README.md)
 - [Simulation](simulation/README.md)
 - [Experiment data](data/README.md)
 

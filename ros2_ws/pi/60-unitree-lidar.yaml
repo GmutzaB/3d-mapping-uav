@@ -1,0 +1,15 @@
+# Static address on the Pi's Ethernet port for the Unitree L2.
+# The L2 ships at 192.168.1.62 and sends its data to 192.168.1.2.
+#
+# Install:
+#   sudo cp 60-unitree-lidar.yaml /etc/netplan/
+#   sudo chmod 600 /etc/netplan/60-unitree-lidar.yaml
+#   sudo netplan apply
+#
+# This takes the Ethernet port off DHCP, so use Wi-Fi for internet.
+network:
+  version: 2
+  ethernets:
+    eth0:
+      dhcp4: false
+      addresses: [192.168.1.2/24]

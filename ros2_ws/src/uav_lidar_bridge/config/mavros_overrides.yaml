@@ -1,0 +1,7 @@
+# Loaded after MAVROS's stock apm_config.yaml.
+
+/mavros/**/obstacle:
+  ros__parameters:
+    # Our scan is body-relative (sector 0 forward, clockwise). The plugin default,
+    # GLOBAL, would make ArduPilot treat sector 0 as north.
+    mav_frame: BODY_FRD
