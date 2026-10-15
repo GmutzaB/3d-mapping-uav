@@ -1,6 +1,6 @@
 # ROS 2 workspace (Raspberry Pi 5)
 
-Runs on the drone's Pi 5 with Ubuntu 24.04 and ROS 2 Jazzy:
+Runs on the drone's Pi 5 with Ubuntu 24.04 (ROS 2 Jazzy) or Ubuntu 26.04 (ROS 2 Lyrical):
 
 - **Unitree L2 driver** publishes the point cloud (`/unilidar/cloud`) and IMU (`/unilidar/imu`).
 - **MAVROS** talks MAVLink to the ArduCopter flight controller and exposes it as ROS 2 topics (`/mavros/state`, `/mavros/local_position/pose`, `/mavros/imu/data`, ...).
@@ -20,9 +20,9 @@ pi/
 
 ## 1. Put Ubuntu on the Pi
 
-ROS 2 Jazzy has prebuilt packages for Ubuntu 24.04 but not Raspberry Pi OS, so reflash the SD card:
+These ROS 2 packages exist for Ubuntu, not Raspberry Pi OS. Use Ubuntu Server 24.04 LTS or 26.04 LTS, 64-bit. `pi/install.sh` installs Jazzy on 24.04 and Lyrical on 26.04.
 
-1. Open **Raspberry Pi Imager** → Device: Raspberry Pi 5 → OS: *Other general-purpose OS → Ubuntu → Ubuntu Server 24.04 LTS (64-bit)*.
+1. Open **Raspberry Pi Imager** → Device: Raspberry Pi 5 → OS: *Other general-purpose OS → Ubuntu → Ubuntu Server 24.04 LTS or 26.04 LTS (64-bit)*.
 2. In the settings (gear icon), set the username to `ubuntu`, a password, your Wi-Fi, and enable SSH.
 3. Boot the Pi and SSH in: `ssh ubuntu@<pi-ip>`.
 

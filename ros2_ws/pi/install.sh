@@ -1,16 +1,24 @@
 #!/usr/bin/env bash
-# One-time setup on a Raspberry Pi 5 running Ubuntu 24.04 (64-bit).
-# Installs ROS 2 Jazzy, MAVROS and build tools, then builds this workspace.
-# Safe to run again after pulling new code.
+# One-time setup on a Raspberry Pi 5 running 64-bit Ubuntu 24.04 or 26.04.
+# 24.04 installs ROS 2 Jazzy; 26.04 installs ROS 2 Lyrical. Then MAVROS and
+# this workspace are built. Safe to run again after pulling new code.
 set -euo pipefail
 
 WS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 . /etc/os-release
-if [[ "${VERSION_ID}" != "24.04" || "$(uname -m)" != "aarch64" ]]; then
-  echo "Expected Ubuntu 24.04 on aarch64, found ${PRETTY_NAME} on $(uname -m)." >&2
+if [[ "$(uname -m)" != "aarch64" ]]; then
+  echo "Expected aarch64, found $(uname -m)." >&2
   exit 1
 fi
+case "${VERSION_ID}" in
+  24.04) ROS_DISTRO=jazzy ;;
+  26.04) ROS_DISTRO=lyrical ;;
+  *)
+    echo "Expected Ubuntu 24.04 (ROS 2 Jazzy) or 26.04 (ROS 2 Lyrical), found ${PRETTY_NAME}." >&2
+    exit 1
+    ;;
+esac
 
 sudo apt-get update
 sudo apt-get install -y software-properties-common curl
@@ -26,27 +34,28 @@ fi
 
 sudo apt-get update
 sudo apt-get install -y \
-  ros-jazzy-ros-base ros-dev-tools \
-  ros-jazzy-pcl-conversions libpcl-dev \
-  ros-jazzy-tf2-ros ros-jazzy-sensor-msgs-py \
-  ros-jazzy-mavros ros-jazzy-mavros-extras \
+  "ros-${ROS_DISTRO}-ros-base" ros-dev-tools \
+  "ros-${ROS_DISTRO}-pcl-conversions" libpcl-dev \
+  "ros-${ROS_DISTRO}-tf2-ros" "ros-${ROS_DISTRO}-sensor-msgs-py" \
+  "ros-${ROS_DISTRO}-mavros" "ros-${ROS_DISTRO}-mavros-extras" \
   python3-numpy
 
 # MAVROS won't start without the GeographicLib datasets.
-sudo /opt/ros/jazzy/lib/mavros/install_geographiclib_datasets.sh
+sudo "/opt/ros/${ROS_DISTRO}/lib/mavros/install_geographiclib_datasets.sh"
 
 # Serial access to the flight controller without sudo (takes effect after re-login).
 sudo usermod -aG dialout "$USER"
 
 set +u
-source /opt/ros/jazzy/setup.bash
+# shellcheck disable=SC1090
+source "/opt/ros/${ROS_DISTRO}/setup.bash"
 set -u
 cd "$WS"
 colcon build --symlink-install
 
 if ! grep -qF "$WS/install/setup.bash" ~/.bashrc; then
   {
-    echo 'source /opt/ros/jazzy/setup.bash'
+    echo "source /opt/ros/${ROS_DISTRO}/setup.bash"
     echo "source $WS/install/setup.bash"
   } >> ~/.bashrc
 fi
