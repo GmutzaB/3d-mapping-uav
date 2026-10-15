@@ -38,7 +38,7 @@ sudo apt-get install -y \
   "ros-${ROS_DISTRO}-pcl-conversions" libpcl-dev \
   "ros-${ROS_DISTRO}-tf2-ros" "ros-${ROS_DISTRO}-sensor-msgs-py" \
   "ros-${ROS_DISTRO}-mavros" "ros-${ROS_DISTRO}-mavros-extras" \
-  python3-numpy
+  python3-numpy libblas3 liblapack3
 
 # MAVROS won't start without the GeographicLib datasets.
 sudo "/opt/ros/${ROS_DISTRO}/lib/mavros/install_geographiclib_datasets.sh"
