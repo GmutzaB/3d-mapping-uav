@@ -44,6 +44,19 @@ def _wall_gap(points):
     return np.minimum(to_x, to_y)
 
 
+def _room_with_floor():
+    """Walls plus a dense floor and a blob at the sensor. Those match at any heading."""
+    rng = np.random.default_rng(1)
+    floor = np.column_stack((
+        rng.uniform(-1.8, 1.8, 1200),
+        rng.uniform(-1.8, 1.8, 1200),
+        np.zeros(1200),
+    ))
+    near = rng.normal(0, 0.04, (400, 3))
+    near[:, 2] *= 0.2
+    return np.vstack((_room(count=80), floor, near))
+
+
 def yaw(radians):
     cosine, sine = np.cos(radians), np.sin(radians)
     return np.array([[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]])
@@ -165,6 +178,29 @@ class StableMapTests(unittest.TestCase):
         self.assertEqual(tracker.add_scan(scan, rotation_hint=np.eye(3)), "aligned")
         self.assertAlmostEqual(heading_deg(tracker.rotation), 90, delta=6)
         self.assertLess(len(tracker.map), seed_count * 1.15)
+
+    def test_floor_points_do_not_spin_the_walls_into_rays(self):
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        self.assertEqual(tracker.add_scan(original), "seed")
+        seed_count = len(tracker.map)
+        for degrees in (20, 45, 90):
+            scan = apply_pose(yaw(np.deg2rad(degrees)).T, np.zeros(3), original)
+            self.assertEqual(tracker.add_scan(scan, rotation_hint=np.eye(3)), "aligned")
+            self.assertAlmostEqual(heading_deg(tracker.rotation), degrees, delta=6)
+        cloud = tracker.map.xyz()
+        self.assertLess(len(cloud), seed_count * 1.25)
+        walls = cloud[(cloud[:, 2] > 0.05) & (np.linalg.norm(cloud[:, :2], axis=1) > 1.2)]
+        self.assertGreater(len(walls), 40)
+        self.assertLess(np.percentile(_wall_gap(walls), 90), 0.08)
+
+    def test_a_wrong_gyro_turn_does_not_override_the_walls(self):
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        tracker.add_scan(original)
+        scan = apply_pose(yaw(np.deg2rad(15)).T, np.zeros(3), original)
+        self.assertEqual(tracker.add_scan(scan, rotation_hint=yaw(np.deg2rad(80))), "aligned")
+        self.assertAlmostEqual(heading_deg(tracker.rotation), 15, delta=8)
 
     def test_gyro_integration_tracks_a_steady_turn(self):
         imu = ImuTrack()

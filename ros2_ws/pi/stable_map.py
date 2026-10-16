@@ -21,6 +21,7 @@ import numpy as np
 SOURCE_CAP = 1500
 TARGET_CAP = 3000
 MIN_PAIRS = 40
+MIN_RANGE = 0.4
 
 
 def write_pcd(path: Path, pts: np.ndarray) -> None:
@@ -149,25 +150,33 @@ def pose_guess(previous_rotation, imu_delta):
     return previous_rotation @ imu_delta
 
 
-def align_scan(source, target, target_normals, rotation, translation, max_distance, iterations=8):
+def align_scan(source, source_normals, target, target_normals, rotation, translation, max_distance, iterations=8):
     """Pull source onto the map planes. Returns pose, acceptance, and mean plane error.
 
     The incoming rotation is only the starting guess. A strong match may replace
     its yaw, and the returned rotation is the one that must be kept for the next spin.
+    Floor points match at every heading, so only upright surfaces are allowed to
+    accept a pose. Accepting on the floor draws the walls again as rays.
     """
     rotation = np.array(rotation, dtype=np.float64, copy=True)
     translation = np.array(translation, dtype=np.float64, copy=True)
+    source = np.asarray(source, dtype=np.float64)
+    source_normals = np.asarray(source_normals, dtype=np.float64)
     target = np.asarray(target, dtype=np.float64)
     target_normals = np.asarray(target_normals, dtype=np.float64)
-    if (np.linalg.norm(target_normals, axis=1) > 0.5).sum() < MIN_PAIRS or len(source) < MIN_PAIRS or len(target) < MIN_PAIRS:
+    if len(source) < MIN_PAIRS or len(target) < MIN_PAIRS:
         return rotation, translation, False, None
     chosen = stride_index(len(target), TARGET_CAP)
     target = target[chosen]
     target_normals = target_normals[chosen]
-    source = np.asarray(source, dtype=np.float64)[stride_index(len(source), SOURCE_CAP)]
-    current_rotation, current_translation = _yaw_search(
-        source, target, rotation, translation, max_distance
+    chosen = stride_index(len(source), SOURCE_CAP)
+    source = source[chosen]
+    source_normals = source_normals[chosen]
+    current_rotation, current_translation, yaw_ok = _yaw_search(
+        source, source_normals, target, target_normals, rotation, translation, max_distance
     )
+    if not yaw_ok:
+        return rotation, translation, False, None
     tight = max(0.08, min(0.12, max_distance * 0.35))
     for step in range(iterations):
         limit = max_distance if step < iterations // 2 else tight
@@ -185,20 +194,11 @@ def align_scan(source, target, target_normals, rotation, translation, max_distan
         current_translation = delta_rotation @ current_translation + delta_translation
         if np.linalg.norm(delta_translation) < 1e-3 and _rotation_angle(delta_rotation) < 1e-3:
             break
-    moved = apply_pose(current_rotation, current_translation, source)
-    paired = correspondences(moved, target, tight)
-    keep = paired >= 0
-    # Most of the sweep has to land on the map. A turned copy of the room matches
-    # only a wedge, and inserting the rest draws the room again at a new angle.
-    if keep.sum() < MIN_PAIRS or keep.sum() / len(source) < 0.55:
+    fit = _wall_fit(
+        source, source_normals, current_rotation, current_translation, target, target_normals, tight
+    )
+    if fit is None:
         return rotation, translation, False, None
-    use = _with_normals(paired, target_normals)
-    if use.sum() < MIN_PAIRS:
-        return rotation, translation, False, None
-    residual = np.sum(target_normals[paired[use]] * (moved[use] - target[paired[use]]), axis=1)
-    fit = float(np.median(np.abs(residual)))
-    if fit > 0.03:
-        return rotation, translation, False, fit
     return current_rotation, current_translation, True, fit
 
 
@@ -211,16 +211,38 @@ def _with_normals(paired, normals):
     return use
 
 
-def _yaw_search(source, target, rotation, translation, max_distance):
-    """Pick the body yaw, around the prior, that lands on the same surfaces.
+def _upright_mask(points, normals, min_range):
+    """Upright surfaces. The floor is flat in every heading, so it cannot vote."""
+    points = np.asarray(points, dtype=np.float64)
+    normals = np.asarray(normals, dtype=np.float64)
+    if len(points) == 0:
+        return np.zeros(0, dtype=bool)
+    horizontal = np.linalg.norm(normals[:, :2], axis=1)
+    ranged = np.linalg.norm(points, axis=1) >= min_range
+    return (horizontal > 0.7) & ranged
+
+
+def _wall_points(points, normals, min_range):
+    keep = _upright_mask(points, normals, min_range)
+    if keep.sum() < MIN_PAIRS:
+        return None
+    return points[keep]
+
+
+def _yaw_search(source, source_normals, target, target_normals, rotation, translation, max_distance):
+    """Pick the body yaw, around the prior, that lands the walls on the walls.
 
     The gate is tight on purpose. A wide gate counts a point that merely reaches
     some wall, so a square room scores just as well a quarter-turn off, and the
     sweep is stored as another rotated copy.
     """
     gate = max(0.08, min(0.12, max_distance * 0.35))
-    probe_source = source[stride_index(len(source), 400)]
-    probe_target = target[stride_index(len(target), 800)]
+    probe_source = _wall_points(source, source_normals, MIN_RANGE)
+    probe_target = _wall_points(target, target_normals, 0.0)
+    if probe_source is None or probe_target is None:
+        return rotation, translation, False
+    probe_source = probe_source[stride_index(len(probe_source), 400)]
+    probe_target = probe_target[stride_index(len(probe_target), 800)]
     best_rotation = rotation
     best_score = _inlier_count(probe_source, probe_target, rotation, translation, gate)
     best_offset = 0
@@ -232,7 +254,32 @@ def _yaw_search(source, target, rotation, translation, max_distance):
             best_score = score
             best_offset = degrees
             best_rotation = candidate
-    return best_rotation, translation
+    return best_rotation, translation, True
+
+
+def _wall_fit(source, source_normals, rotation, translation, target, target_normals, gate):
+    """Share of upright points that land on an upright surface, and their plane error.
+
+    Returns None when the walls miss. A high score from the floor alone is a miss.
+    Source points are still in the lidar frame, so the near-field blob around the
+    sensor is dropped before the pose is applied.
+    """
+    keep = _upright_mask(source, source_normals, MIN_RANGE)
+    stored_keep = _upright_mask(target, target_normals, 0.0)
+    if keep.sum() < MIN_PAIRS or stored_keep.sum() < MIN_PAIRS:
+        return None
+    walls = apply_pose(rotation, translation, source[keep])
+    stored = target[stored_keep]
+    paired = correspondences(walls, stored, gate)
+    hits = paired >= 0
+    if hits.sum() < MIN_PAIRS or hits.sum() / len(walls) < 0.55:
+        return None
+    stored_normals = target_normals[stored_keep]
+    residual = np.sum(stored_normals[paired[hits]] * (walls[hits] - stored[paired[hits]]), axis=1)
+    fit = float(np.median(np.abs(residual)))
+    if fit > 0.03:
+        return None
+    return fit
 
 
 def _yaw_matrix(radians):
@@ -448,7 +495,7 @@ class Tracker:
         else:
             guess_rotation = pose_guess(self.rotation, rotation_hint)
         rotation, translation, ok, fit = align_scan(
-            xyz, self.map.xyz(), self.map.normals(),
+            xyz, normals, self.map.xyz(), self.map.normals(),
             guess_rotation, self.translation, self.max_correspondence,
         )
         self.last_fit = fit
