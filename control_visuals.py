@@ -18,7 +18,7 @@ def export(datasets, output):
     fig.subplots_adjust(left=.075,right=.975,bottom=.12,top=.84,hspace=.7,wspace=.25)
     fig.suptitle('DRONE STABILIZATION / FEEDBACK COMPARISON',x=.075,ha='left',y=.98,fontsize=19,fontweight='bold',color='#142d4e')
     fig.text(.075,.935,'0–10 s hover  •  10–14 s: 10° roll request  •  14 s: level request  •  17–17.15 s: torque pulse',fontsize=10)
-    fig.text(.075,.904,'Same initial state and disturbance. Fixed-throttle baseline ignores attitude requests. Playback: 2× speed.',fontsize=10)
+    fig.text(.075,.904,'9 in props • 900 KV • 7000 or 10000 mAh • provisional 2.2 kg. Same initial state and disturbance. Playback: 2× speed.',fontsize=10)
     fig.text(.075,.03,'SIMULATION ONLY • Provisional parameters • Perfect state feedback • No ground contact\nAttitude views are centered on the aircraft. Angle/height axes use different scales. Tilt causes sideways drift; position is not held.',fontsize=10,color='#4a5d73')
     colors = ['#087f8c','#ed7e32','#6c58a6','#cf4770']
     # Keep both panels comparable while making small control corrections visible.

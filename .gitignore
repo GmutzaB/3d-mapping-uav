@@ -1,7 +1,20 @@
 .venv/
 __pycache__/
 .DS_Store
-outputs/
+outputs/*
+!outputs/simulation.png
+!outputs/simulation-10000mah.png
+!outputs/flight/
+outputs/flight/*
+!outputs/flight/*.png
+!outputs/flight/*.gif
+!outputs/grid_comparison/
+outputs/grid_comparison/*
+!outputs/grid_comparison/comparison.png
+!outputs/control/
+outputs/control/*
+!outputs/control/*.png
+!outputs/control/*.gif
 .mplconfig/
 
 # Downloaded supporting software and robotics build products

@@ -7,18 +7,20 @@ from pathlib import Path
 os.environ.setdefault("MPLCONFIGDIR", str(Path(__file__).parent / ".mplconfig"))
 import numpy as np
 
-
-def propeller(throttle, motor_kv=1500, battery_cells=6, prop_diameter_in=7):
-    """Empirical static thrust estimate, independent of the flow solver."""
-    rho, diameter = 1.225, prop_diameter_in * 0.0254
-    rpm = motor_kv * (3.7 * battery_cells) * 0.80 * throttle
-    thrust = 0.11 * rho * (rpm / 60)**2 * diameter**4
-    area = np.pi * diameter**2 / 4
-    return dict(rpm=rpm, thrust_per_motor_N=thrust,
-                total_quad_thrust_N=4 * thrust,
-                equivalent_supported_mass_kg=4 * thrust / 9.81,
-                ideal_disk_pressure_jump_Pa=thrust / area,
-                ideal_induced_velocity_m_s=float(np.sqrt(thrust / (2 * rho * area))))
+from hardware import (
+    BATTERY_CELLS,
+    BATTERY_MAH_OPTIONS,
+    DEFAULT_BATTERY_MAH,
+    MASS_KG,
+    MOTOR_KV,
+    NOMINAL_CELL_VOLTAGE_V,
+    PROP_DIAMETER_IN,
+    THRUST_COEFFICIENT,
+    LOADED_RPM_FACTOR,
+    hardware_caption,
+    nominal_energy_wh,
+    propeller,
+)
 
 
 class Flow:
@@ -74,18 +76,24 @@ def main():
     parser.add_argument("--viscosity", type=float, default=0.001,
                         help="Effective kinematic viscosity [m²/s], deliberately above air viscosity")
     parser.add_argument("--output", type=Path, default=Path("outputs"))
-    parser.add_argument("--prop-diameter-in", type=float, default=7)
-    parser.add_argument("--prop-pitch-in", type=float, default=4.5, help="Recorded only; pitch effects are not modeled")
-    parser.add_argument("--mass-kg", type=float, default=2.2, help="Assumed total takeoff mass including battery and payload")
-    parser.add_argument("--motor-kv", type=float, default=1500)
-    parser.add_argument("--battery-cells", type=int, default=6)
-    parser.add_argument("--battery-mah", type=float, default=4500)
-    parser.add_argument("--battery-c", type=float, default=50)
+    parser.add_argument("--prop-diameter-in", type=float, default=PROP_DIAMETER_IN)
+    parser.add_argument("--prop-pitch-in", type=float, default=None,
+                        help="Recorded only. The 9 inch prop has no pitch specification yet, and pitch is not modeled")
+    parser.add_argument("--mass-kg", type=float, default=MASS_KG,
+                        help="Planning takeoff mass, shared by both battery packs until each pack is weighed")
+    parser.add_argument("--motor-kv", type=float, default=MOTOR_KV)
+    parser.add_argument("--battery-cells", type=int, default=BATTERY_CELLS,
+                        help="Nominal series count. Voltage was not restated with the 900 KV motors")
+    parser.add_argument("--battery-mah", type=int, default=DEFAULT_BATTERY_MAH, choices=BATTERY_MAH_OPTIONS,
+                        help="7000 or 10000 mAh. Capacity is recorded as energy and does not change thrust")
+    parser.add_argument("--battery-c", type=float, default=None,
+                        help="Recorded only. Neither candidate pack has a supplied C rating")
     parser.add_argument("--force-thickness", type=float, default=0.05,
                         help="Fixed forcing thickness [m], shared across grid comparisons")
     args = parser.parse_args()
+    optional = [value for value in (args.prop_pitch_in, args.battery_c) if value is not None]
     if not (all(np.isfinite(v) and v > 0 for v in
-                (args.mass_kg, args.prop_diameter_in, args.prop_pitch_in, args.motor_kv, args.battery_mah, args.battery_c, args.force_thickness))
+                (args.mass_kg, args.prop_diameter_in, args.motor_kv, args.battery_mah, args.force_thickness, *optional))
             and args.battery_cells > 0):
         parser.error("Hardware values and force thickness must be positive and finite")
     if not (0 <= args.throttle <= 1 and 0 < args.seconds <= 60
@@ -129,12 +137,18 @@ def main():
                    required_hover_thrust_per_motor_N=args.mass_kg*9.81/4,
                    thrust_model_validated=False,
                    motor_kv=args.motor_kv, battery_cells=args.battery_cells,
-                   battery_nominal_voltage_V=3.7*args.battery_cells,
-                   battery_capacity_mAh=args.battery_mah, battery_c_rating=args.battery_c,
-                   battery_nominal_energy_Wh=3.7*args.battery_cells*args.battery_mah/1000,
+                   battery_nominal_voltage_V=NOMINAL_CELL_VOLTAGE_V*args.battery_cells,
+                   battery_capacity_mAh=args.battery_mah,
+                   battery_c_rating=args.battery_c,
+                   battery_nominal_energy_Wh=nominal_energy_wh(args.battery_mah, args.battery_cells),
+                   battery_options=[
+                       {"capacity_mAh": pack, "nominal_energy_Wh": nominal_energy_wh(pack, args.battery_cells)}
+                       for pack in BATTERY_MAH_OPTIONS
+                   ],
                    propeller_diameter_m=2*radius, propeller_diameter_in=args.prop_diameter_in,
-                   propeller_pitch_in=args.prop_pitch_in, pitch_effects_modeled=False, thrust_coefficient=0.11,
-                   loaded_rpm_factor=0.8, force_thickness_m=thickness,
+                   propeller_pitch_in=args.prop_pitch_in, pitch_effects_modeled=False,
+                   thrust_coefficient=THRUST_COEFFICIENT,
+                   loaded_rpm_factor=LOADED_RPM_FACTOR, force_thickness_m=thickness,
                    peak_speed_m_s=float(speed.max()),
                    rms_speed_m_s=float(np.sqrt(np.mean(speed**2))),
                    pressure_min_Pa=float(pressure.min()), pressure_max_Pa=float(pressure.max()),
@@ -163,8 +177,8 @@ def main():
     fig.suptitle("3D Mapping UAV — 2D periodic flow model\n"
                  f"Grid {args.grid}×{args.grid} | t={t:g} s | throttle={args.throttle:.0%} | "
                  f"viscosity={flow.nu:g} m²/s | forcing width={thickness:g} m\n"
-                 f"Provisional: {args.motor_kv:g} KV, {args.battery_cells}S "
-                 f"{args.battery_mah:g} mAh {args.battery_c:g}C | {args.prop_diameter_in:g}×{args.prop_pitch_in:g} in prop (pitch not modeled), Ct=0.11")
+                 + hardware_caption(args.motor_kv, args.battery_cells, args.battery_mah,
+                                    args.prop_diameter_in, args.prop_pitch_in, args.battery_c))
     fig.savefig(args.output / "simulation.png", dpi=160)
     plt.close(fig)
     print(json.dumps(summary, indent=2))

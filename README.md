@@ -65,7 +65,7 @@ $$\partial_t\mathbf{u}+(\mathbf{u}\cdot\nabla)\mathbf{u}=-\nabla p/\rho+\nu\nabl
 
 It uses Fourier derivatives, a two-thirds spectral filter, pressure projection, and second-order time stepping with adaptive steps. Boundaries are periodic; pressure has zero spatial mean. Background: [NASA Navier–Stokes intro](https://www1.grc.nasa.gov/beginners-guide-to-aeronautics/navier-strokes-equation/).
 
-Provisional hardware defaults: 1500 KV, nominal 22.2 V 6S, 4500 mAh, 50C. Capacity and C rating are metadata, not a current or endurance model. Propeller assumptions: 7-inch diameter × 4.5-inch pitch (pitch effects not modeled), 0.80 loaded RPM factor, Ct = 0.11, density 1.225 kg/m³, four motors:
+Hardware defaults: 900 KV motors, nominal 22.2 V 6S, and either a 7000 mAh or a 10000 mAh pack. Capacity is metadata, not a current or endurance model. The propeller diameter is 9 inches. Pitch and C rating were not supplied, and pitch is not modeled. The loaded RPM factor is 0.80, Ct = 0.11, density 1.225 kg/m³, four motors:
 
 $$RPM=K_V V\eta s,\quad T=C_T\rho(RPM/60)^2D^4,\quad A=\pi D^2/4,\quad\Delta p=T/A,\quad v_i=\sqrt{T/(2\rho A)}.$$
 
@@ -91,13 +91,13 @@ Colors use shared limits so different runs are directly comparable.
 
 All simulations now use a fixed 0.05 m forcing thickness (previously grid dependent).
 This changes the baseline result, but avoids changing the physical forcing width in a grid study.
-Override it with `--force-thickness`. The provisional 7×4.5-inch propeller, Ct=0.11, and 0.8 loaded RPM factor
+Override it with `--force-thickness`. The 9-inch propeller, Ct=0.11, and 0.8 loaded RPM factor
 remain unvalidated assumptions, not a hardware compatibility recommendation.
 
 Hardware can change without editing code, for example:
 
 ```sh
-.venv/bin/python compare_grids.py --motor-kv 1500 --battery-cells 6 --battery-mah 4500 --battery-c 50 --seconds 0.15
+.venv/bin/python compare_grids.py --motor-kv 900 --battery-cells 6 --battery-mah 10000 --seconds 0.15
 ```
 
 The same hardware flags work with `simulation.py`. Voltage uses 3.7 V per cell nominal;
@@ -106,16 +106,18 @@ whole-field differences at shared grid points; smaller differences with refineme
 consistency, but do not establish real-world accuracy. Adaptive time steps also change with
 grid size, so this is an initial refinement study, not an isolated spatial convergence proof.
 
-Propeller dimensions are configurable with `--prop-diameter-in 7 --prop-pitch-in 4.5`.
-Diameter controls the empirical thrust formula and rotor strip width. Pitch is recorded
-and displayed only; Ct and loaded RPM still need data for the chosen motor/prop combination.
+Propeller diameter is configurable with `--prop-diameter-in`. The default is 9.
+Diameter controls the empirical thrust formula and rotor strip width. `--prop-pitch-in`
+is recorded and displayed only when you supply it. Ct and loaded RPM still need data
+for this motor and propeller.
 
 ## Aircraft mass and hardware details
 
-See [HARDWARE.md](HARDWARE.md) for the supplied motor and two-blade 7×4.5 propeller
-specifications and unresolved mounting details. `--mass-kg` defaults to 2.2 kg total
-takeoff mass. The thrust chart shows the corresponding hover target; the summary saves
-total and per-motor required thrust. This does not validate the estimated thrust curve.
+See [HARDWARE.md](HARDWARE.md) for the 9-inch frame, 900 KV motors, and the 7000 mAh
+and 10000 mAh packs. `--mass-kg` defaults to 2.2 kg total takeoff mass, and that same
+placeholder is used for both packs until each pack is weighed. `--battery-mah` accepts
+`7000` or `10000`. The thrust chart shows the hover target for that mass; the summary
+saves both pack energies. This does not validate the estimated thrust curve.
 
 ## Share a flight-model visual
 

@@ -1,17 +1,24 @@
 """Offline rigid-body quad model. SI units, world NED, body FRD; no hardware I/O."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import argparse
 import json
 from pathlib import Path
 import numpy as np
 
+from hardware import MASS_KG, propeller
+
+
+def _empirical_motor_ceiling():
+    """Full-throttle output of the unvalidated static-thrust formula. Not a dyno curve."""
+    return float(propeller(1.0)["thrust_per_motor_N"])
+
 
 @dataclass(frozen=True)
 class Parameters:
-    mass: float = 2.2
-    arm: float = 0.20  # CG-to-motor distance, unmeasured
+    mass: float = MASS_KG
+    arm: float = 0.20  # CG-to-motor distance, unmeasured; motor spacing still clears a 9 inch prop
     inertia: tuple = (0.025, 0.025, 0.045)  # diagonal kg m^2, unmeasured
-    max_thrust: float = 12.0  # N per motor, placeholder, NOT hardware evidence
+    max_thrust: float = field(default_factory=_empirical_motor_ceiling)
     yaw_ratio: float = 0.015  # reaction torque / thrust, m, unmeasured
     motor_tau: float = 0.04  # seconds, thrust response approximation
     drag: float = 0.0  # world isotropic linear drag N/(m/s)
