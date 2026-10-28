@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.14)
 project(unitree_lidar_ros2)
 
 # Default to C99
@@ -23,6 +23,7 @@ find_package(pcl_conversions REQUIRED)
 find_package(PCL REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(Threads REQUIRED)
 
 include_directories(
   ${PCL_INCLUDE_DIRS} 
@@ -39,20 +40,25 @@ add_definitions(${PCL_DEFINITIONS})
 
 add_executable(unitree_lidar_ros2_node src/unitree_lidar_ros2_node.cpp)
 
-target_link_libraries( unitree_lidar_ros2_node
-  ${Boost_SYSTEM_LIBRARY}
+# Lyrical removed ament_target_dependencies. Message packages export
+# ${pkg_TARGETS}; C++ packages export namespaced targets.
+set(_unitree_lidar_deps
   ${PCL_LIBRARIES}
-  libunilidar_sdk2.a
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../unitree_lidar_sdk/lib/${CMAKE_SYSTEM_PROCESSOR}/libunilidar_sdk2.a"
+  Threads::Threads
+  rclcpp::rclcpp
+  tf2_ros::tf2_ros
+  ${std_msgs_TARGETS}
+  ${sensor_msgs_TARGETS}
+  ${geometry_msgs_TARGETS}
 )
-
-ament_target_dependencies(
-  unitree_lidar_ros2_node
-  rclcpp std_msgs 
-  sensor_msgs
-  geometry_msgs 
-  tf2_ros
-  pcl_conversions
-)
+if(TARGET pcl_conversions::pcl_conversions)
+  list(APPEND _unitree_lidar_deps pcl_conversions::pcl_conversions)
+else()
+  # Jazzy exports the headers without a CMake target.
+  target_include_directories(unitree_lidar_ros2_node PRIVATE ${pcl_conversions_INCLUDE_DIRS})
+endif()
+target_link_libraries(unitree_lidar_ros2_node ${_unitree_lidar_deps})
 
 install(TARGETS
 unitree_lidar_ros2_node
