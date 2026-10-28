@@ -1,61 +1,57 @@
-# Provisional quadcopter hardware
+# Quadcopter hardware
 
-Source: user-supplied propeller specifications and motor specification image.
-Exact manufacturer/model and thrust data for this combination are not yet available.
+Current selection, October 28, 2026: a **9-inch** frame, **900 KV** motors, and either a
+**7000 mAh** or a **10000 mAh** battery. Manufacturer, pitch, C rating, and pack mass
+were not supplied. The earlier 7×4.5 inch propeller, 1500 KV motor sheet, and 4500 mAh
+pack are recorded at the bottom and are no longer the model defaults.
 
 ## Mass assumption
 
-Total takeoff mass: **2.2 kg**, including battery and mapping payload. This is a planning
-assumption, not a measured mass or confirmed upper bound. Hover requires 21.582 N total,
-or 5.3955 N per rotor with equal loading (550 gram-force each).
-### Known component mass budget
+Total takeoff mass: **2.2 kg**, including battery and mapping payload. This is still a
+planning assumption, not a measured mass. Both battery capacities use this same number
+until each pack is weighed. Hover at 2.2 kg requires 21.582 N total, or 5.3955 N per
+rotor with equal loading (550 gram-force each).
+
+### Known component mass
 
 | Component | Quantity | Unit mass | Subtotal |
 |---|---:|---:|---:|
-| Motors, including cables | 4 | 46.7 g | 186.8 g |
-| Propellers | 4 | 6.6 g | 26.4 g |
-| Battery | 1 | 618 g | 618 g |
-| Unitree L2 4D LiDAR | 1 | 230 g | 230 g |
-| **Subtotal including candidate L2** | | | **1061.2 g** |
-| **Remaining within 2200 g target** | | | **1138.8 g** |
+| Unitree L2 4D LiDAR (candidate) | 1 | 230 g | 230 g |
+| 900 KV motors | 4 | not supplied | — |
+| 9 inch propellers | 4 | not supplied | — |
+| 7000 mAh or 10000 mAh battery | 1 | not supplied | — |
 
-The remaining allowance must cover the frame, ESCs, flight controller, receiver,
-other sensors, any companion computer, power distribution/regulators, additional wiring,
-mounts, landing gear, and fasteners. Avoid counting the included motor cables twice.
-The listed components including candidate L2 already exceed the earlier hoped-for 1 kg total.
-The 2.2 kg value remains a target until the remaining components are weighed.
-The user is investigating mounting compatibility and the lack of combination thrust data.
+The frame, ESCs, flight controller, Pi 5, wiring, mounts, and landing gear are also
+still unweighed. The 2.2 kg figure stays in the models only as that shared placeholder.
 
 ## Propeller (each)
 
-- Diameter: 7 inches; pitch: 4.5 inches
-- Blades: 2; material: polycarbonate
-- Mass: 6.6 g
-- Hub diameter: 13.5 mm; hub thickness: 7.5 mm
-- Bore: 5 mm (user specification labeled “shaft”)
+- Diameter: **9 inches**. This is the value in the thrust formula and the rotor strip.
+- Pitch: not supplied. Pitch is not modeled.
+- Blade count, material, mass, hub, and bore: not supplied for this propeller.
 
-## Motor (each; transcribed from image)
+## Motor (each)
 
-- KV: 1500; rated LiPo: 5–6S
-- Dimensions: diameter 33.4 × 34.7 mm
-- Mass including cable: 46.7 g
-- Shaft diameter: 4 mm
-- Lead: 20 AWG, 230 mm
-- Configuration: 12N14P
-- Internal resistance: 62 milliohms
-- Idle current at 10 V: 1.2 A
-- Peak current (60 seconds): 47.1 A
-- Maximum power (60 seconds): 1089 W
+- KV: **900**
+- Count: 4
+- Voltage class, mass, dimensions, resistance, and current ratings: not supplied with this change.
 
-These peak ratings are not hover consumption or continuous ratings. The image does not
-establish the current or thrust with this specific propeller. Check the actual propeller
-mount/adapter dimensions: a listed 4 mm motor shaft and 5 mm propeller bore alone do not
-establish fit, since a separate propeller mount may be used.
+The airflow model still uses a nominal **6S / 22.2 V** (3.7 V per cell) because the
+voltage was not restated. Say so if these motors are on a different cell count.
 
 ## Battery
 
-Provisional 6S, 4500 mAh, 50C LiPo; nominal model voltage 22.2 V.
-Mass: **618 g**, supplied by the user. Exact model is unknown.
+One aircraft, two candidate packs. `--battery-mah` accepts `7000` or `10000`.
+The default run records 7000 mAh and also stores the other pack's energy.
+
+| Pack | Nominal energy at 6S |
+|---|---:|
+| 7000 mAh | 155.4 Wh |
+| 10000 mAh | 222.0 Wh |
+
+Capacity does not change RPM or thrust in this model. C rating and pack mass were not
+supplied. A heavier 10000 mAh pack would raise the real hover throttle; the 2.2 kg
+placeholder does not show that difference.
 
 ## Mapping payload
 
@@ -65,13 +61,21 @@ been verified for the connection plan.
 
 ## What the code uses
 
-Motor KV, nominal battery voltage, and propeller diameter enter the empirical thrust
-formula. Pitch is recorded only. Blade count, material, motor resistance, and peak ratings
-are documented here but are not aerodynamic/electrical model inputs. Ct=0.11 and the
-0.8 loaded RPM factor remain unvalidated assumptions. The hover target is a weight balance,
-not evidence that this hardware achieves it. Current draw and endurance are not predicted.
+`hardware.py` is the shared selection. Motor KV, nominal battery voltage, and propeller
+diameter enter the empirical thrust formula in the airflow model. The rigid-body model's
+per-motor thrust ceiling is that same formula at full throttle. Pitch is recorded only
+when passed on the command line. Ct=0.11 and the 0.8 loaded RPM factor remain unvalidated
+assumptions. The hover target is a weight balance, not evidence that this hardware
+achieves it. Current draw and endurance are not predicted.
 
-Use `--mass-kg 2.2` with either simulation script to change the total mass assumption.
+```sh
+python simulation.py --battery-mah 7000
+python simulation.py --battery-mah 10000
+```
+
+Use `--mass-kg` when a pack has been weighed. The arm length in `flight_dynamics.py`
+is still the unmeasured 0.20 m. Center-to-center motor spacing at that arm is about
+0.28 m, which clears a 9-inch (0.23 m) propeller; it is not a measured frame dimension.
 
 ## Flight electronics and onboard computer
 
@@ -90,7 +94,15 @@ Use `--mass-kg 2.2` with either simulation script to change the total mass assum
 These items are part of the 2.2 kg total allowance, not additional mass on top of it.
 Their unknown weights have not been added to the known subtotal. Electrical compatibility and onboard computer power consumption have not yet been verified.
 
-## Latest user clarification — September 28, 2026
+## Superseded specification
+
+The previous model used a user-supplied 7×4.5 inch, 2-blade, 6.6 g propeller and a
+1500 KV motor sheet (46.7 g with cable, 5–6S, 62 milliohm, 47.1 A peak for 60 seconds,
+1089 W peak for 60 seconds), plus a 6S 4500 mAh 50C pack listed at 618 g. Those parts
+are not the current selection. Their peak ratings were never hover current, and they
+are not applied to the 900 KV motors.
+
+## Earlier clarification — September 28, 2026
 
 The project is being built from the ground up. The owned electronics are an STM H743
 flight controller with a 55A ESC stack; the exact manufacturer/revision still needs

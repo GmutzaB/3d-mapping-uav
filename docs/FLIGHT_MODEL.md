@@ -32,10 +32,12 @@ ArduPilot motor numbering assignment. Yaw signs specify reaction torque on the b
 
 ## Calibration and limitations
 
-Mass is the provisional 2.2 kg target. Arm length, diagonal inertia, thrust ceiling,
-yaw torque ratio and motor time constant are placeholders. The 12 N thrust ceiling
-is not derived from the existing airflow curve and is not evidence of motor capability.
-Use `Parameters(...)` from Python to run sensitivity studies; these are not flight settings.
+Mass is the provisional 2.2 kg target, shared by the 7000 mAh and 10000 mAh packs until
+each pack is weighed. Arm length, diagonal inertia, yaw torque ratio and motor time
+constant are still unmeasured. The per-motor thrust ceiling is the full-throttle output
+of the same unvalidated 900 KV / 9-inch static-thrust formula used by the airflow model.
+It is not a measured motor curve. Use `Parameters(...)` from Python to run sensitivity
+studies; these are not flight settings.
 
 Measure total assembled mass, center of gravity, motor positions and inertia (CAD
 mass distribution followed by an experimental check). Obtain a thrust/current/RPM

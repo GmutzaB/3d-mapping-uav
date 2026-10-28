@@ -1,7 +1,16 @@
 """Numerical checks against an exact periodic Navier–Stokes solution."""
 import unittest
 import numpy as np
+from hardware import (
+    BATTERY_CELLS,
+    BATTERY_MAH_OPTIONS,
+    MOTOR_KV,
+    NOMINAL_CELL_VOLTAGE_V,
+    PROP_DIAMETER_IN,
+    nominal_energy_wh,
+)
 from simulation import Flow, propeller
+from flight_dynamics import Parameters
 
 
 class PhysicsTests(unittest.TestCase):
@@ -33,6 +42,16 @@ class PhysicsTests(unittest.TestCase):
         large = propeller(0.5, prop_diameter_in=7)
         self.assertAlmostEqual(large['thrust_per_motor_N'] / small['thrust_per_motor_N'], (7/5)**4)
         self.assertAlmostEqual(large['ideal_disk_pressure_jump_Pa'] / small['ideal_disk_pressure_jump_Pa'], (7/5)**2)
+
+    def test_selected_aircraft_defaults(self):
+        full = propeller(1)
+        self.assertEqual(MOTOR_KV, 900)
+        self.assertEqual(PROP_DIAMETER_IN, 9)
+        self.assertEqual(BATTERY_MAH_OPTIONS, (7000, 10000))
+        self.assertAlmostEqual(full["rpm"], 900 * NOMINAL_CELL_VOLTAGE_V * BATTERY_CELLS * 0.8)
+        self.assertAlmostEqual(Parameters().max_thrust, full["thrust_per_motor_N"])
+        self.assertAlmostEqual(nominal_energy_wh(7000), 3.7 * 6 * 7)
+        self.assertAlmostEqual(nominal_energy_wh(10000), 3.7 * 6 * 10)
 
     def test_throttle_squared(self):
         self.assertEqual(propeller(0)["thrust_per_motor_N"], 0)

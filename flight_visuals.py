@@ -23,7 +23,7 @@ def export_visuals(rows, quad, scenario, output):
     ax = fig.add_subplot(grid[:,0],projection='3d')
     charts = [fig.add_subplot(grid[i,1]) for i in range(3)]
     fig.suptitle('DRONE FLIGHT MODEL  /  '+scenario.upper(),x=.06,ha='left',fontsize=20,fontweight='bold',color='#142d4e')
-    fig.text(.06,.88,'Simulated data • provisional 2.2 kg aircraft • no flight-controller feedback',fontsize=11,color='#4a5d73')
+    fig.text(.06,.88,'Simulated data • 9 in props • 900 KV • provisional 2.2 kg • no flight-controller feedback',fontsize=11,color='#4a5d73')
     fig.text(.06,.035,'Uncalibrated model — not measured flight data.\nHeight is relative to the starting point; ground contact is not modeled.',fontsize=10,color='#4a5d73')
     ax.plot(*centers.T,color='#b9c9da',lw=2,label='Full trajectory')
     path, = ax.plot([],[],[],color='#087f8c',lw=2)

@@ -7,6 +7,7 @@ import subprocess
 import sys
 
 import simulation  # Sets the local Matplotlib cache directory.
+from hardware import hardware_caption
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -68,9 +69,8 @@ def main():
     s = summaries[0]
     fig.suptitle(f"Grid comparison | t={s['simulated_seconds']:g} s | throttle={s['throttle']:.0%} | "
                  f"viscosity={s['effective_viscosity_m2_s']:g} m²/s | forcing width={s['force_thickness_m']:g} m\n"
-                 f"Provisional {s['motor_kv']:g} KV, {s['battery_cells']}S, "
-                 f"{s['battery_capacity_mAh']:g} mAh, {s['battery_c_rating']:g}C | "
-                 f"{s['propeller_diameter_in']:g}×{s['propeller_pitch_in']:g} in prop (pitch not modeled), Ct=0.11")
+                 + hardware_caption(s['motor_kv'], s['battery_cells'], s['battery_capacity_mAh'],
+                                    s['propeller_diameter_in'], s.get('propeller_pitch_in'), s.get('battery_c_rating')))
     fig.savefig(args.output/'comparison.png', dpi=160)
     plt.close(fig)
     note = ['Grid study: differences are numerical comparisons, not validation against real hardware.',
