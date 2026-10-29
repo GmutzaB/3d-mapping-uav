@@ -9,8 +9,10 @@ The IMU orientation is the direction the lidar is actually facing, measured
 from that first cloud. The gyro turn is used only when the orientation is missing.
 The move since the last kept sweep comes from the IMU's own clock (the cloud
 stamp is a different clock) plus the speed of the last sweep that lined up.
-If that guess misses, the sweep is tried again within about 2 m. Holding the
-lidar still at the new spot can lock on, instead of skipping forever.
+Walk, turn, and lift freely. A sweep that sits on the walls is stored.
+A sweep that misses while the lidar is moving is not stored, but the pose
+keeps following that motion so the next sweep can lock on. A miss with no
+motion to follow stays put and is tried again within about 2 m.
 The floor and walls pull that guess back into place.
 
 Leave the lidar launch running, then:
@@ -93,6 +95,30 @@ def stride_index(count, limit):
         return np.arange(count)
     step = int(np.ceil(count / limit))
     return np.arange(0, count, step)
+
+
+def _spread_index(coords, limit):
+    """Indexes spread across parallel planes, not bunched on the nearest one.
+
+    A uniform stride of a sweep that is mostly a new wall keeps that wall and
+    drops the older ones. The search then slides the new wall onto whatever
+    it touches. Each plane along ``coords`` keeps a share of the sample.
+    """
+    coords = np.asarray(coords, dtype=np.float64)
+    count = len(coords)
+    if count <= limit:
+        return np.arange(count)
+    buckets = np.round(coords / 0.5).astype(np.int64)
+    unique = np.unique(buckets)
+    per = max(1, int(np.ceil(limit / len(unique))))
+    chosen = []
+    for bucket in unique:
+        idx = np.flatnonzero(buckets == bucket)
+        chosen.append(idx[stride_index(len(idx), per)])
+    chosen = np.concatenate(chosen)
+    if len(chosen) > limit:
+        chosen = chosen[stride_index(len(chosen), limit)]
+    return chosen
 
 
 def rodrigues(rotvec):
@@ -316,8 +342,16 @@ def _refine(source, source_normals, target, target_normals, rotation, translatio
         use = _with_normals(paired, target_normals)
         if use.sum() < MIN_PAIRS:
             break
-        delta_rotation, delta_translation, step_ok = _plane_step(
+        # One new wall can be most of the correspondences. Left in, it drags
+        # the pose onto the stored wall it happens to face, and the sweep that
+        # was a few centimetres off never seats.
+        seated, paired_target, paired_normals = _balanced_pairs(
             moved[use], target[paired[use]], target_normals[paired[use]]
+        )
+        if len(seated) < MIN_PAIRS:
+            break
+        delta_rotation, delta_translation, step_ok = _plane_step(
+            seated, paired_target, paired_normals
         )
         if not step_ok:
             break
@@ -393,14 +427,17 @@ def _direction_pairs(source, source_normals, target, target_normals, rotation):
     stored_bins = _normal_bins(target_normals[stored_keep])
     source_points = source[keep]
     stored_points = target[stored_keep]
+    # Bin in the map, without the translation: parallel walls stay apart, and
+    # the sample does not depend on the pose being searched.
+    posed_source = (np.asarray(rotation, dtype=np.float64) @ source_points.T).T
     pairs = []
     for direction in (0, 1):
         src_idx = np.flatnonzero(source_bins == direction)
         dst_idx = np.flatnonzero(stored_bins == direction)
         if len(src_idx) < 15 or len(dst_idx) < 15:
             continue
-        src_idx = src_idx[stride_index(len(src_idx), 80)]
-        dst_idx = dst_idx[stride_index(len(dst_idx), 200)]
+        src_idx = src_idx[_spread_index(posed_source[src_idx, direction], 80)]
+        dst_idx = dst_idx[_spread_index(stored_points[dst_idx, direction], 200)]
         pairs.append((source_points[src_idx], stored_points[dst_idx]))
     return pairs
 
@@ -654,6 +691,60 @@ def _yaw_matrix(radians):
 def _inlier_count(source, target, rotation, translation, max_distance):
     moved = apply_pose(rotation, translation, source)
     return int((correspondences(moved, target, max_distance) >= 0).sum())
+
+
+def _balanced_pairs(moved, matched, normals, cap=40):
+    """Keep every surface that belongs to one pose, and cap how hard it pulls.
+
+    Points are already paired. A second parallel wall sits farther off the
+    plane than the walls that agree with each other. That farther wall is
+    dropped. The floor is its own direction, so a lift is still observed.
+    Each remaining surface is capped, so the biggest wall does not outvote
+    the others.
+    """
+    moved = np.asarray(moved, dtype=np.float64)
+    matched = np.asarray(matched, dtype=np.float64)
+    normals = np.asarray(normals, dtype=np.float64)
+    count = len(moved)
+    if count < MIN_PAIRS:
+        return moved, matched, normals
+    residual = np.abs(np.einsum("ij,ij->i", normals, moved - matched))
+    vertical = np.abs(normals[:, 2]) > 0.7
+    facing_y = np.abs(normals[:, 1]) > np.abs(normals[:, 0])
+    kind = np.where(vertical, 2, facing_y.astype(np.int64))
+    axis_pos = np.where(vertical, moved[:, 2], np.where(facing_y, moved[:, 1], moved[:, 0]))
+    bucket = np.round(axis_pos / 0.5).astype(np.int64)
+    key = kind.astype(np.int64) * 100000 + (bucket + 5000)
+    order = np.argsort(key, kind="mergesort")
+    sorted_key = key[order]
+    starts = np.concatenate(([0], np.flatnonzero(np.diff(sorted_key)) + 1))
+    ends = np.concatenate((starts[1:], [count]))
+    groups = []
+    best = [None, None, None]
+    for start, end in zip(starts, ends):
+        idx = order[start:end]
+        med = float(np.median(residual[idx]))
+        this_kind = int(kind[idx[0]])
+        groups.append((idx, med, this_kind))
+        if len(idx) >= 8:
+            current = best[this_kind]
+            if current is None or med < current:
+                best[this_kind] = med
+    chosen = []
+    for idx, med, this_kind in groups:
+        baseline = best[this_kind]
+        if baseline is None or med <= baseline + 0.15:
+            if len(idx) > cap:
+                # An even stride can stop a few short of the cap and leave the
+                # plane step with nothing to solve. Take exactly cap points.
+                pick = np.linspace(0, len(idx) - 1, cap).astype(np.int64)
+                idx = idx[np.unique(pick)]
+            chosen.append(idx)
+    if not chosen:
+        empty = slice(0, 0)
+        return moved[empty], matched[empty], normals[empty]
+    use = np.concatenate(chosen)
+    return moved[use], matched[use], normals[use]
 
 
 def _plane_step(source, target, normals):
@@ -1021,6 +1112,11 @@ class Tracker:
         rotation = translation = None
         ok = False
         fit = None
+        # Where an explicit motion measurement would put the lidar. Kept so a
+        # sweep that cannot lock still follows the move instead of freezing.
+        # The last step alone is not a measurement: coasting on it would walk
+        # the pose while the lidar is sitting still.
+        motion_guess = None
         for use_motion in (True, False):
             guess_translation = np.array(previous_translation, copy=True)
             if use_motion:
@@ -1032,12 +1128,16 @@ class Tracker:
                 if motion_length > STEP_LIMIT:
                     motion = motion * (STEP_LIMIT / motion_length)
                 guess_translation = guess_translation + motion
+                explicit = carried is not None
                 if translation_hint is not None:
                     hint = np.asarray(translation_hint, dtype=np.float64)
                     length = float(np.linalg.norm(hint))
                     if length > STEP_LIMIT:
                         hint = hint * (STEP_LIMIT / length)
                     guess_translation = guess_translation + hint
+                    explicit = True
+                if explicit:
+                    motion_guess = np.array(guess_translation, copy=True)
             rotation, translation, ok, fit = align_scan(
                 xyz, normals, self.map.xyz(), self.map.normals(),
                 guess_rotation, guess_translation, self.max_correspondence,
@@ -1046,9 +1146,22 @@ class Tracker:
                 break
         self.last_fit = fit
         if not ok:
-            # Keep the last speed. Zeroing it left the next guess at the start
-            # after a single miss, and every later sweep then missed too.
-            return "skipped"
+            if motion_guess is None:
+                # Keep the last speed. Zeroing it left the next guess at the
+                # start after a single miss, and every later sweep then missed too.
+                return "skipped"
+            delta = motion_guess - previous_translation
+            length = float(np.linalg.norm(delta))
+            if length < 0.02:
+                return "skipped"
+            if length > STEP_LIMIT:
+                delta = delta * (STEP_LIMIT / length)
+            # The walls did not agree, so nothing is stored. The pose still
+            # moves, and the next sweep is guessed from here.
+            self.rotation = guess_rotation
+            self.translation = previous_translation + delta
+            self.step = delta
+            return "tracking"
         moved = apply_pose(rotation, translation, xyz)
         moved_normals = (rotation @ normals.T).T
         fresh = self.map.novel_mask(moved)
@@ -1079,7 +1192,7 @@ def collect(seconds_between_saves, topic, imu_topic, output, voxel, max_correspo
     pending = {}
     last_save = time.monotonic()
     last_kept = None
-    counts = {"seed": 0, "aligned": 0, "skipped": 0}
+    counts = {"seed": 0, "aligned": 0, "tracking": 0, "skipped": 0}
     # The sensor profile keeps five messages. A sweep used to take long enough
     # that the gyro and accel samples in between were thrown away.
     imu_qos = QoSProfile(
@@ -1109,7 +1222,7 @@ def collect(seconds_between_saves, topic, imu_topic, output, voxel, max_correspo
     node.create_subscription(Imu, imu_topic, on_imu, imu_qos)
     print(
         f"mapping {topic} into {output} with about {voxel * 1000:.1f} mm between points"
-        " — hold still until the count levels off, then move",
+        " — hold still until the count levels off, then move it freely",
         flush=True,
     )
 
@@ -1191,7 +1304,8 @@ def collect(seconds_between_saves, topic, imu_topic, output, voxel, max_correspo
                 f"lidar at {place[0]:.2f} {place[1]:.2f} {place[2]:.2f} m, "
                 f"yaw={heading_deg(tracker.rotation):5.1f}° face={face} dIMU={dimu}, "
                 f"wall fit {fit}, imu {'on' if imu_on else 'off'}, "
-                f"aligned {counts['aligned']}, skipped {counts['skipped']}",
+                f"aligned {counts['aligned']}, tracking {counts['tracking']}, "
+                f"skipped {counts['skipped']}",
                 flush=True,
             )
             if tracker.map and time.monotonic() - last_save >= seconds_between_saves:
