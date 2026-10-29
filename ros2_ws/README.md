@@ -84,7 +84,23 @@ Wait until it stays up without exiting. Check it from anywhere else with `ros2 t
 python3 ~/3d-mapping-uav/ros2_ws/pi/stable_map.py
 ```
 
-Hold the lidar still for about 2 seconds, then turn slowly. `yaw=` is the map heading and should climb as you face a new direction. `dIMU=` is the gyro turn on that spin. One room should stay put. `skipped` means that sweep did not land on the map, so pause instead of walking on. Ctrl-C writes `~/map.pcd` (it is also rewritten every 5 seconds). Copy it to a computer and open it in CloudCompare:
+Hold the lidar still until the point count is in the tens of thousands and stops climbing. The first line should already be thousands of points, not a handful. A few more sweeps may add points, then a finished surface stays `aligned` and the count holds. The pose wobbles by a few centimetres and the range wanders by about a centimetre, so that wobble is not stored as a second wall. The first sweep, and any surface that is actually new, is still kept about every 2.5 mm.
+
+Then walk, turn, or lift it, including while you keep moving. This is the same mapper that has to keep working once the lidar is on the drone, so it maps while the sensor is moving, not only while it sits still. `aligned` means that sweep was pulled onto the map and new points were stored. `tracking` means the walls did not lock, so that sweep was not stored, but `lidar at x y z` is still following the motion and the next sweep can lock. `lidar at` should keep changing as you move, including after the first step, when most of the sweep is a view the map has not stored yet. `z` rises when you lift it and stays up. `yaw=` is the map heading. `face=` is the direction the IMU says the lidar is facing since the first cloud. `dIMU=` is how far the gyro turned since the last sweep that was kept. One room should stay one room. If it keeps saying `tracking`, hold still until it says `aligned` again. `skipped` means that sweep did not line up and there was no motion to follow. It looks again within about 2 m of the last pose. A jump farther than that stays skipped until you bring it back. Ctrl-C writes `~/map.pcd` (it is also rewritten every 5 seconds). A new run overwrites that file.
+
+After a mapper-only change, leave the lidar window running. In the map window, Ctrl-C, then:
+
+```sh
+cd ~/3d-mapping-uav
+git fetch origin
+git checkout cursor/lidar-facing-yaw-f923
+git pull
+source /opt/ros/lyrical/setup.bash
+source ~/3d-mapping-uav/ros2_ws/install/setup.bash
+python3 ~/3d-mapping-uav/ros2_ws/pi/stable_map.py
+```
+
+On Ubuntu 24.04, source `/opt/ros/jazzy/setup.bash` instead of lyrical. Copy the map to a computer and open it in CloudCompare:
 
 ```sh
 scp mtbf@mtbf:~/map.pcd .

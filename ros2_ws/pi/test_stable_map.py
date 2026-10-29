@@ -4,7 +4,17 @@ import unittest
 
 import numpy as np
 
-from stable_map import ImuTrack, StableMap, Tracker, apply_pose, heading_deg, pose_guess
+from stable_map import (
+    DEFAULT_VOXEL,
+    ImuTrack,
+    StableMap,
+    Tracker,
+    apply_pose,
+    heading_deg,
+    novelty_gate,
+    pose_guess,
+    quat_xyzw_to_rot,
+)
 
 
 def corner(seed=0):
@@ -62,7 +72,40 @@ def yaw(radians):
     return np.array([[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]])
 
 
+def pitch(radians):
+    cosine, sine = np.cos(radians), np.sin(radians)
+    return np.array([[cosine, 0.0, sine], [0.0, 1.0, 0.0], [-sine, 0.0, cosine]])
+
+
+def _rotation_error(left, right):
+    cosine = np.clip((np.trace(left.T @ right) - 1.0) * 0.5, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cosine)))
+
+
 class StableMapTests(unittest.TestCase):
+    def test_default_spacing_is_a_few_millimetres(self):
+        tracker = Tracker()
+        self.assertAlmostEqual(tracker.voxel, 0.0025)
+        self.assertAlmostEqual(tracker.voxel, DEFAULT_VOXEL)
+        # New points stay 2.5 mm apart. A repeat of the same surface has to
+        # clear the centimetre of range noise before it is stored again.
+        self.assertAlmostEqual(novelty_gate(0.0025), 0.02)
+        self.assertAlmostEqual(tracker.map.gate, 0.02)
+        self.assertGreater(novelty_gate(0.05), 0.05)
+
+    def test_points_a_few_millimetres_apart_are_both_kept(self):
+        grid = StableMap(0.0025)
+        added = grid.insert([[0.0, 0.0, 0.0], [0.003, 0.0, 0.0]], [1.0, 1.0])
+        self.assertEqual(added, 2)
+        self.assertEqual(grid.insert([[0.001, 0.0, 0.0]], [1.0]), 0)
+        # 5 mm shares the stored cell, so it is the same surface.
+        # 6 cm of pose wobble along the wall is still that surface.
+        # 16 cm is past the cells that count as pose wobble and range scatter.
+        mask = grid.novel_mask([[0.16, 0.0, 0.0], [0.0, 0.06, 0.0], [0.005, 0.0, 0.0]])
+        self.assertTrue(bool(mask[0]))
+        self.assertFalse(bool(mask[1]))
+        self.assertFalse(bool(mask[2]))
+
     def test_first_point_in_a_voxel_is_kept(self):
         grid = StableMap(0.1)
         added = grid.insert([[0.01, 0.01, 0.01], [0.04, 0.02, 0.0]], [1.0, 9.0])
@@ -120,6 +163,22 @@ class StableMapTests(unittest.TestCase):
         # moving 4 cm toward the wall. Motion along the wall stays small.
         np.testing.assert_allclose(tracker.translation[0], -0.04, atol=0.03)
         self.assertLess(abs(tracker.translation[1]), 0.08)
+
+    def test_wobble_along_a_wall_is_not_stored_again(self):
+        # The pose can slide a few centimetres along a wall while the range
+        # error stays about a centimetre. That used to paint a second sheet
+        # and the count climbed on every still sweep.
+        ys = np.linspace(-0.4, 0.4, 50)
+        zs = np.linspace(0.2, 1.0, 24)
+        yy, zz = np.meshgrid(ys, zs)
+        base = np.column_stack((np.full(yy.size, 2.0), yy.ravel(), zz.ravel()))
+        tracker = Tracker()
+        self.assertEqual(tracker.add_scan(base), "seed")
+        before = len(tracker.map)
+        slid = base + np.array([0.012, 0.06, 0.0])
+        self.assertLess(float(tracker.map.novel_mask(slid).mean()), 0.08)
+        self.assertEqual(tracker.add_scan(slid), "aligned")
+        self.assertLess(len(tracker.map), before + max(30, before // 10))
 
     def test_repeating_the_same_wall_does_not_thicken_it(self):
         rng = np.random.default_rng(2)
@@ -202,12 +261,508 @@ class StableMapTests(unittest.TestCase):
         self.assertEqual(tracker.add_scan(scan, rotation_hint=yaw(np.deg2rad(80))), "aligned")
         self.assertAlmostEqual(heading_deg(tracker.rotation), 15, delta=8)
 
+    def _moved(self, original, rotation, translation):
+        return apply_pose(rotation.T, -rotation.T @ translation, original)
+
+    def test_a_short_first_cloud_does_not_freeze_the_map(self):
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        handful = np.array([
+            [1.0, 0.0, 0.5],
+            [1.1, 0.2, 0.6],
+            [0.9, -0.2, 0.4],
+            [1.2, 0.1, 0.7],
+        ])
+        self.assertEqual(tracker.add_scan(handful), "seed")
+        self.assertEqual(len(tracker.map), 4)
+        original = _room_with_floor()
+        self.assertEqual(tracker.add_scan(original), "seed")
+        self.assertGreater(len(tracker.map), 40)
+        translation = np.array([0.0, 0.0, 0.15])
+        scan = self._moved(original, np.eye(3), translation)
+        self.assertEqual(tracker.add_scan(scan, facing=np.eye(3)), "aligned")
+        np.testing.assert_allclose(tracker.translation, translation, atol=0.05)
+
+    def test_a_lift_is_not_pulled_back_to_the_origin(self):
+        rng = np.random.default_rng(3)
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        tracker.add_scan(original)
+        seed_count = len(tracker.map)
+        translation = np.array([0.0, 0.0, 0.18])
+        scan = self._moved(original, np.eye(3), translation)
+        self.assertEqual(tracker.add_scan(scan, facing=np.eye(3)), "aligned")
+        for _ in range(3):
+            noisy = scan + rng.normal(0, 0.008, scan.shape)
+            self.assertEqual(
+                tracker.add_scan(
+                    noisy,
+                    facing=np.eye(3),
+                    translation_hint=np.array([0.0, 0.0, -0.8]),
+                ),
+                "aligned",
+            )
+            np.testing.assert_allclose(tracker.translation, translation, atol=0.05)
+        self.assertLess(len(tracker.map), seed_count * 1.2)
+
+    def test_a_lift_stays_on_one_room(self):
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        self.assertEqual(tracker.add_scan(original), "seed")
+        seed_count = len(tracker.map)
+        translation = np.array([0.0, 0.0, 0.22])
+        scan = self._moved(original, np.eye(3), translation)
+        self.assertEqual(tracker.add_scan(scan, facing=np.eye(3)), "aligned")
+        np.testing.assert_allclose(tracker.translation, translation, atol=0.04)
+        self.assertLess(len(tracker.map), seed_count * 1.15)
+        floor = tracker.map.xyz()
+        floor = floor[floor[:, 2] < 0.05]
+        self.assertLess(np.median(np.abs(floor[:, 2])), 0.02)
+
+    def test_walking_and_lifting_follow_the_lidar(self):
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        tracker.add_scan(original)
+        seed_count = len(tracker.map)
+        poses = (
+            (np.eye(3), np.array([0.00, 0.00, 0.15])),
+            (np.eye(3), np.array([0.16, 0.00, 0.30])),
+            (yaw(np.deg2rad(25)), np.array([0.28, -0.08, 0.42])),
+            (pitch(np.deg2rad(12)), np.array([0.28, -0.08, 0.20])),
+        )
+        for rotation, translation in poses:
+            scan = self._moved(original, rotation, translation)
+            self.assertEqual(
+                tracker.add_scan(scan, facing=rotation),
+                "aligned",
+            )
+            np.testing.assert_allclose(tracker.translation, translation, atol=0.05)
+            self.assertLess(_rotation_error(tracker.rotation, rotation), 8.0)
+        cloud = tracker.map.xyz()
+        self.assertLess(len(cloud), seed_count * 1.25)
+        walls = cloud[(cloud[:, 2] > 0.05) & (np.linalg.norm(cloud[:, :2], axis=1) > 1.2)]
+        self.assertLess(np.percentile(_wall_gap(walls), 90), 0.08)
+        floor = cloud[np.abs(cloud[:, 2]) < 0.08]
+        self.assertGreater(len(floor), 40)
+
+    def test_a_turn_while_lifting_does_not_need_a_perfect_guess(self):
+        # This used to be dropped: the guess stayed at the origin, and the
+        # combined turn and step was too far for the match gate.
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        tracker.add_scan(original)
+        seed_count = len(tracker.map)
+        rotation = yaw(np.deg2rad(40))
+        translation = np.array([0.20, 0.10, 0.25])
+        scan = self._moved(original, rotation, translation)
+        self.assertEqual(tracker.add_scan(scan, facing=rotation), "aligned")
+        np.testing.assert_allclose(tracker.translation, translation, atol=0.05)
+        self.assertLess(len(tracker.map), seed_count * 1.15)
+
+    def test_steady_motion_is_carried_to_the_next_sweep(self):
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.2)
+        tracker.add_scan(original)
+        first = np.array([0.0, 0.0, 0.12])
+        self.assertEqual(
+            tracker.add_scan(self._moved(original, np.eye(3), first), facing=np.eye(3)),
+            "aligned",
+        )
+        # The next lift is 0.25 m, past the 0.2 m match distance from the last
+        # pose. The carried step puts the guess close enough to seat it.
+        second = np.array([0.0, 0.0, 0.37])
+        self.assertEqual(
+            tracker.add_scan(self._moved(original, np.eye(3), second), facing=np.eye(3)),
+            "aligned",
+        )
+        np.testing.assert_allclose(tracker.translation, second, atol=0.05)
+
+    def test_a_move_that_sees_new_space_still_locks_on(self):
+        # Half the sweep is a wall the map has never seen. Requiring most of
+        # the cloud to land on the old room used to skip this, and holding
+        # still there skipped forever.
+        rng = np.random.default_rng(12)
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        tracker.add_scan(original)
+        translation = np.array([0.70, -0.35, 0.12])
+        scan = self._moved(original, np.eye(3), translation)
+        extra = np.column_stack((
+            np.full(500, 6.0),
+            rng.uniform(-1.2, 1.2, 500),
+            rng.uniform(0.2, 1.4, 500),
+        ))
+        extra = self._moved(extra, np.eye(3), translation)
+        cloud = np.vstack((scan, extra))
+        seed_count = len(tracker.map)
+        self.assertEqual(tracker.add_scan(cloud, facing=np.eye(3)), "aligned")
+        np.testing.assert_allclose(tracker.translation, translation, atol=0.08)
+        # The new wall is stored on the sweep that first sees it.
+        self.assertGreater(len(tracker.map), seed_count + 50)
+        before = len(tracker.map)
+        self.assertEqual(tracker.add_scan(cloud, facing=np.eye(3)), "aligned")
+        np.testing.assert_allclose(tracker.translation, translation, atol=0.08)
+        # Holding still there keeps aligning, and does not lay that wall again.
+        self.assertLess(len(tracker.map), before + 30)
+
+    def test_a_sideways_guess_does_not_slide_the_room(self):
+        # Walls parallel to the guess still touch the map. That used to look
+        # like a match and the room was stored a second time, shifted over.
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        tracker.add_scan(original)
+        self.assertEqual(
+            tracker.add_scan(
+                original,
+                facing=np.eye(3),
+                translation_hint=np.array([0.8, 0.0, 0.0]),
+            ),
+            "aligned",
+        )
+        np.testing.assert_allclose(tracker.translation, np.zeros(3), atol=0.08)
+
+    def test_a_gyro_gap_is_not_a_phantom_spin(self):
+        imu = ImuTrack()
+        rate = np.array([0.0, 0.0, np.deg2rad(90)])
+        imu.push(0.0, rate)
+        imu.push(0.01, rate)
+        imu.push(2.0, rate)
+        turned = imu.rotation_since(0.0, 2.0)
+        self.assertIsNotNone(turned)
+        self.assertLess(abs(heading_deg(turned)), 15.0)
+
+    def test_holding_still_after_a_move_locks_on(self):
+        # The guess stays at the start, and this pose is not on the old axis
+        # samples. The same cloud is then repeated. Those repeats have to align
+        # at the new spot instead of skipping forever.
+        rng = np.random.default_rng(11)
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        tracker.add_scan(original)
+        translation = np.array([0.62, -0.48, 0.27])
+        scan = self._moved(original, np.eye(3), translation)
+        self.assertEqual(tracker.add_scan(scan, facing=np.eye(3)), "aligned")
+        np.testing.assert_allclose(tracker.translation, translation, atol=0.08)
+        for _ in range(3):
+            noisy = scan + rng.normal(0, 0.008, scan.shape)
+            self.assertEqual(tracker.add_scan(noisy, facing=np.eye(3)), "aligned")
+            np.testing.assert_allclose(tracker.translation, translation, atol=0.08)
+        self.assertLess(len(tracker.map), len(original) * 2)
+
+    def test_a_move_a_metre_away_is_found_when_the_lidar_stops(self):
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        tracker.add_scan(original)
+        translation = np.array([1.15, 0.85, 0.0])
+        scan = self._moved(original, np.eye(3), translation)
+        self.assertEqual(tracker.add_scan(scan, facing=np.eye(3)), "aligned")
+        np.testing.assert_allclose(tracker.translation, translation, atol=0.1)
+        self.assertEqual(tracker.add_scan(scan, facing=np.eye(3)), "aligned")
+        np.testing.assert_allclose(tracker.translation, translation, atol=0.1)
+
+    def test_a_wrong_lift_hint_does_not_raise_the_floor(self):
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        tracker.add_scan(original)
+        translation = np.array([0.0, 0.0, 0.05])
+        scan = self._moved(original, np.eye(3), translation)
+        self.assertEqual(
+            tracker.add_scan(scan, facing=np.eye(3), translation_hint=np.array([0.0, 0.0, 0.8])),
+            "aligned",
+        )
+        np.testing.assert_allclose(tracker.translation, translation, atol=0.05)
+
+    def test_accel_integration_removes_gravity(self):
+        imu = ImuTrack()
+        imu.push_orientation((0.0, 0.0, 0.0, 1.0))
+        for step in range(10):
+            imu.push_accel(step * 0.05, (0.0, 0.0, 9.81))
+        imu.lock_origin()
+        imu.lock_gravity()
+        np.testing.assert_allclose(imu.gravity, (0.0, 0.0, 9.81), atol=1e-6)
+        for step in range(11):
+            imu.push_accel(1.0 + step * 0.05, (0.0, 0.0, 11.81))
+        shift = imu.shift_since(1.0, 1.5)
+        np.testing.assert_allclose(shift, (0.0, 0.0, 0.25), atol=0.02)
+
     def test_gyro_integration_tracks_a_steady_turn(self):
         imu = ImuTrack()
         rate = np.array([0.0, 0.0, np.deg2rad(90)])
         for step in range(11):
             imu.push(step * 0.1, rate)
         np.testing.assert_allclose(imu.rotation_since(0.0, 1.0), yaw(np.deg2rad(90)), atol=1e-6)
+
+    def test_quaternion_yaw_is_the_heading(self):
+        half = np.sqrt(0.5)
+        rotation = quat_xyzw_to_rot((0.0, 0.0, half, half))
+        self.assertAlmostEqual(heading_deg(rotation), 90.0, delta=1e-6)
+        np.testing.assert_allclose(rotation, yaw(np.deg2rad(90)), atol=1e-6)
+        self.assertIsNone(quat_xyzw_to_rot((0.0, 0.0, 0.0, 0.0)))
+
+    def test_facing_is_the_turn_since_the_map_started(self):
+        imu = ImuTrack()
+        imu.push_orientation((0.0, 0.0, 0.0, 1.0))
+        self.assertIsNone(imu.facing_in_map())
+        imu.lock_origin()
+        self.assertAlmostEqual(heading_deg(imu.facing_in_map()), 0.0, delta=1e-6)
+        half = np.deg2rad(20.0)
+        imu.push_orientation((0.0, 0.0, np.sin(half), np.cos(half)))
+        self.assertAlmostEqual(heading_deg(imu.facing_in_map()), 40.0, delta=1e-4)
+        imu.push_orientation((0.0, 0.0, 0.0, 0.0))
+        self.assertAlmostEqual(heading_deg(imu.facing_in_map()), 40.0, delta=1e-4)
+
+    def test_reported_facing_places_a_turned_room_once(self):
+        # The gyro reports no turn. The quaternion says the lidar has faced 40
+        # degrees since the first cloud. The walls must land once, at that heading.
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        self.assertEqual(tracker.add_scan(original), "seed")
+        seed_count = len(tracker.map)
+        scan = apply_pose(yaw(np.deg2rad(40)).T, np.zeros(3), original)
+        self.assertEqual(
+            tracker.add_scan(scan, rotation_hint=np.eye(3), facing=yaw(np.deg2rad(40))),
+            "aligned",
+        )
+        self.assertAlmostEqual(heading_deg(tracker.rotation), 40, delta=6)
+        self.assertLess(len(tracker.map), seed_count * 1.15)
+        cloud = tracker.map.xyz()
+        walls = cloud[(cloud[:, 2] > 0.05) & (np.linalg.norm(cloud[:, :2], axis=1) > 1.2)]
+        self.assertLess(np.percentile(_wall_gap(walls), 90), 0.08)
+
+    def test_facing_is_not_stacked_on_the_previous_yaw(self):
+        original = _room()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        tracker.add_scan(original)
+        seed_count = len(tracker.map)
+        first = apply_pose(yaw(np.deg2rad(20)).T, np.zeros(3), original)
+        self.assertEqual(tracker.add_scan(first, facing=yaw(np.deg2rad(20))), "aligned")
+        self.assertAlmostEqual(heading_deg(tracker.rotation), 20, delta=6)
+        # Absolute facing is 55, and the gyro missed the extra turn. Adding the
+        # 55 on top of the stored 20 would draw a second room.
+        second = apply_pose(yaw(np.deg2rad(55)).T, np.zeros(3), original)
+        self.assertEqual(
+            tracker.add_scan(second, rotation_hint=np.eye(3), facing=yaw(np.deg2rad(55))),
+            "aligned",
+        )
+        self.assertAlmostEqual(heading_deg(tracker.rotation), 55, delta=6)
+        self.assertLess(len(tracker.map), seed_count * 1.25)
+
+    def test_quaternion_facing_keeps_one_room_through_a_half_turn(self):
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        imu = ImuTrack()
+        imu.push_orientation((0.0, 0.0, 0.0, 1.0))
+        self.assertEqual(tracker.add_scan(original, facing=None), "seed")
+        imu.lock_origin()
+        seed_count = len(tracker.map)
+        for degrees in (40, 90, 180):
+            half = np.deg2rad(degrees / 2.0)
+            imu.push_orientation((0.0, 0.0, np.sin(half), np.cos(half)))
+            scan = apply_pose(yaw(np.deg2rad(degrees)).T, np.zeros(3), original)
+            status = tracker.add_scan(
+                scan, rotation_hint=np.eye(3), facing=imu.facing_in_map()
+            )
+            self.assertEqual(status, "aligned")
+            wrapped = (heading_deg(tracker.rotation) - degrees + 180.0) % 360.0 - 180.0
+            self.assertLess(abs(wrapped), 6.0)
+        cloud = tracker.map.xyz()
+        self.assertLess(len(cloud), seed_count * 1.2)
+        walls = cloud[(cloud[:, 2] > 0.05) & (np.linalg.norm(cloud[:, :2], axis=1) > 1.2)]
+        self.assertLess(np.percentile(_wall_gap(walls), 90), 0.08)
+
+    def test_a_wrong_facing_does_not_override_the_walls(self):
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        tracker.add_scan(original)
+        scan = apply_pose(yaw(np.deg2rad(15)).T, np.zeros(3), original)
+        self.assertEqual(
+            tracker.add_scan(scan, facing=yaw(np.deg2rad(80))),
+            "aligned",
+        )
+        self.assertAlmostEqual(heading_deg(tracker.rotation), 15, delta=8)
+
+    def test_sensor_noise_does_not_lay_a_second_sheet(self):
+        rng = np.random.default_rng(9)
+        ys = np.linspace(-0.5, 0.5, 70)
+        zs = np.linspace(0.2, 1.0, 36)
+        yy, zz = np.meshgrid(ys, zs)
+        base = np.column_stack((np.full(yy.size, 2.0), yy.ravel(), zz.ravel()))
+        tracker = Tracker()
+        self.assertEqual(tracker.add_scan(base), "seed")
+        before = len(tracker.map)
+        self.assertGreater(before, 1000)
+        noisy = base + rng.normal(0.0, 0.01, base.shape)
+        self.assertEqual(tracker.add_scan(noisy), "aligned")
+        self.assertLess(len(tracker.map), before + before // 5)
+        opened = base + np.array([0.16, 0.0, 0.0])
+        self.assertGreater(float(tracker.map.novel_mask(opened).mean()), 0.9)
+
+    def test_a_walk_without_an_imu_shift_keeps_aligning(self):
+        # No translation hint: the cloud clock did not match the IMU, which is
+        # what the Pi does. The sweep still has to be found and then carried.
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        tracker.add_scan(original)
+        seed_count = len(tracker.map)
+        translation = np.zeros(3)
+        for step in (
+            np.array([0.55, 0.00, 0.00]),
+            np.array([0.50, 0.35, 0.15]),
+            np.array([0.40, -0.25, 0.20]),
+        ):
+            translation = translation + step
+            scan = self._moved(original, np.eye(3), translation)
+            self.assertEqual(tracker.add_scan(scan, facing=np.eye(3)), "aligned")
+            np.testing.assert_allclose(tracker.translation, translation, atol=0.08)
+        self.assertLess(len(tracker.map), int(seed_count * 1.35) + 5)
+
+    def test_kept_speed_reaches_a_sweep_past_the_match_gate(self):
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.2)
+        tracker.add_scan(original)
+        first = np.array([0.15, 0.0, 0.0])
+        self.assertEqual(
+            tracker.add_scan(self._moved(original, np.eye(3), first), facing=np.eye(3)),
+            "aligned",
+        )
+        tracker.note_elapsed(0.5)
+        second = np.array([1.45, 0.0, 0.0])
+        missed = Tracker(voxel=0.05, max_correspondence=0.2)
+        missed.add_scan(original)
+        missed.add_scan(self._moved(original, np.eye(3), first), facing=np.eye(3))
+        # Past the area searched around the last pose. That sweep stays dropped.
+        self.assertEqual(
+            missed.add_scan(self._moved(original, np.eye(3), np.array([4.0, 0.0, 0.0])), facing=np.eye(3)),
+            "skipped",
+        )
+        carried = tracker.speed * 4.0
+        self.assertEqual(
+            tracker.add_scan(
+                self._moved(original, np.eye(3), second),
+                facing=np.eye(3),
+                carried=carried,
+            ),
+            "aligned",
+        )
+        np.testing.assert_allclose(tracker.translation, second, atol=0.08)
+
+    def test_imu_motion_uses_the_imu_clock_not_the_cloud_stamp(self):
+        imu = ImuTrack()
+        imu.push_orientation((0.0, 0.0, 0.0, 1.0))
+        for step in range(8):
+            imu.push_accel(step * 0.05, (0.0, 0.0, 9.81))
+        imu.lock_origin()
+        imu.lock_gravity()
+        imu.advance()
+        for step in range(11):
+            imu.push_accel(0.40 + step * 0.05, (0.0, 0.0, 11.81))
+        shift = imu.preview_shift()
+        self.assertIsNotNone(shift)
+        self.assertGreater(shift[2], 0.15)
+        self.assertLess(abs(shift[0]) + abs(shift[1]), 0.05)
+        # A cloud stamp in another epoch used to be the window, and it missed.
+        self.assertIsNone(imu.shift_since(100.0, 100.5))
+
+    def test_the_next_step_into_new_space_still_maps(self):
+        # The first move into a new wall locks. The next step is mostly a
+        # newer wall and used to skip, which froze the pose for the rest of
+        # the walk.
+        rng = np.random.default_rng(12)
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        tracker.add_scan(original)
+        translation = np.array([0.70, -0.35, 0.12])
+        extra = np.column_stack((
+            np.full(500, 5.5),
+            rng.uniform(-1.2, 1.2, 500),
+            rng.uniform(0.2, 1.4, 500),
+        ))
+        cloud = np.vstack((
+            self._moved(original, np.eye(3), translation),
+            self._moved(extra, np.eye(3), translation),
+        ))
+        self.assertEqual(tracker.add_scan(cloud, facing=np.eye(3)), "aligned")
+        translation = np.array([0.85, -0.40, 0.12])
+        extra = np.column_stack((
+            np.full(500, 6.0),
+            rng.uniform(-1.2, 1.2, 500),
+            rng.uniform(0.2, 1.4, 500),
+        ))
+        cloud = np.vstack((
+            self._moved(original, np.eye(3), translation),
+            self._moved(extra, np.eye(3), translation),
+        ))
+        before = len(tracker.map)
+        self.assertEqual(tracker.add_scan(cloud, facing=np.eye(3)), "aligned")
+        np.testing.assert_allclose(tracker.translation, translation, atol=0.08)
+        self.assertGreater(len(tracker.map), before + 20)
+        stored = tracker.map.xyz()
+        room = stored[np.abs(stored[:, 0]) < 3.0]
+        walls = room[(room[:, 2] > 0.05) & (np.linalg.norm(room[:, :2], axis=1) > 1.2)]
+        self.assertLess(np.percentile(_wall_gap(walls), 90), 0.08)
+        self.assertGreater(np.sum(stored[:, 0] > 4.5), 30)
+        # Holding still there does not lay the new wall a second time.
+        held = len(tracker.map)
+        self.assertEqual(tracker.add_scan(cloud, facing=np.eye(3)), "aligned")
+        self.assertLess(len(tracker.map), held + 30)
+
+    def test_a_sweep_with_no_walls_follows_the_move_then_maps(self):
+        # A sweep that cannot see a wall used to freeze the pose. The move is
+        # kept, nothing is stored, and the next real view locks at the new spot.
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        tracker.add_scan(original)
+        first = np.array([0.30, 0.05, 0.04])
+        self.assertEqual(
+            tracker.add_scan(self._moved(original, np.eye(3), first), facing=np.eye(3)),
+            "aligned",
+        )
+        held = len(tracker.map)
+        blob = np.random.default_rng(2).normal(0, 0.04, (250, 3))
+        carried = np.array([0.55, -0.20, 0.10])
+        facing = yaw(np.deg2rad(25))
+        self.assertEqual(
+            tracker.add_scan(blob, facing=facing, carried=carried),
+            "tracking",
+        )
+        np.testing.assert_allclose(tracker.translation, first + carried, atol=0.02)
+        self.assertLess(_rotation_error(tracker.rotation, facing), 1.0)
+        self.assertEqual(len(tracker.map), held)
+        # No measurement at all still stays put, even after a real step.
+        before = tracker.translation.copy()
+        self.assertEqual(tracker.add_scan(blob, facing=facing), "skipped")
+        np.testing.assert_allclose(tracker.translation, before)
+        self.assertEqual(len(tracker.map), held)
+        translation = before.copy()
+        scan = self._moved(original, facing, translation)
+        self.assertEqual(tracker.add_scan(scan, facing=facing), "aligned")
+        np.testing.assert_allclose(tracker.translation, translation, atol=0.1)
+        self.assertLess(len(tracker.map), int(held * 1.35) + 5)
+
+    def test_a_free_walk_with_turns_and_lifts_stays_one_room(self):
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        tracker.add_scan(original)
+        seed_count = len(tracker.map)
+        poses = (
+            (np.eye(3), np.array([0.40, 0.05, 0.06])),
+            (yaw(np.deg2rad(18)), np.array([0.78, -0.12, 0.18])),
+            (yaw(np.deg2rad(-12)), np.array([1.15, 0.16, 0.04])),
+            (pitch(np.deg2rad(10)), np.array([1.45, 0.02, 0.22])),
+        )
+        previous = np.zeros(3)
+        for rotation, translation in poses:
+            scan = self._moved(original, rotation, translation)
+            self.assertEqual(
+                tracker.add_scan(scan, facing=rotation, carried=translation - previous),
+                "aligned",
+            )
+            np.testing.assert_allclose(tracker.translation, translation, atol=0.08)
+            self.assertLess(_rotation_error(tracker.rotation, rotation), 8.0)
+            previous = translation
+        cloud = tracker.map.xyz()
+        self.assertLess(len(cloud), seed_count * 1.35)
+        walls = cloud[(cloud[:, 2] > 0.05) & (np.linalg.norm(cloud[:, :2], axis=1) > 1.2)]
+        self.assertLess(np.percentile(_wall_gap(walls), 90), 0.08)
 
 
 if __name__ == "__main__":
