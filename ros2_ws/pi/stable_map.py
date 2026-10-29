@@ -225,7 +225,9 @@ def align_scan(source, source_normals, target, target_normals, rotation, transla
     fit = _wall_fit(
         source, source_normals, current_rotation, current_translation, target, target_normals, tight
     )
-    if fit is None:
+    if fit is None or _floor_fit(
+        source, source_normals, current_rotation, current_translation, target, target_normals, tight
+    ) is None:
         return rotation, translation, False, None
     return current_rotation, current_translation, True, fit
 
@@ -304,23 +306,20 @@ def _shift_search(source, source_normals, target, target_normals, rotation, tran
     translation = np.asarray(translation, dtype=np.float64)
     best_shift = np.array(translation, copy=True)
     best_score = score(best_shift)
-    best_size = 0.0
-    offsets = [(0.0, 0.0, 0.0)]
+    # A point or two of noise used to win a 12 cm jump, and the next sweep
+    # then scored the origin higher and put the lidar back at 0, 0, 0.
+    margin = max(25, int(0.08 * max(best_score, 1)))
     for meters in (0.12, 0.25, 0.40):
-        offsets.extend((
+        for offset in (
             (0.0, 0.0, meters), (0.0, 0.0, -meters),
             (meters, 0.0, 0.0), (-meters, 0.0, 0.0),
             (0.0, meters, 0.0), (0.0, -meters, 0.0),
-        ))
-    for offset in offsets[1:]:
-        shift = translation + np.array(offset)
-        found = score(shift)
-        size = float(np.linalg.norm(offset))
-        closer = found == best_score and size < best_size
-        if found > best_score or closer:
-            best_score = found
-            best_size = size
-            best_shift = shift
+        ):
+            shift = translation + np.array(offset)
+            found = score(shift)
+            if found >= best_score + margin:
+                best_score = found
+                best_shift = shift
     return best_shift
 
 
@@ -375,6 +374,33 @@ def _wall_fit(source, source_normals, rotation, translation, target, target_norm
     if fit > 0.03:
         return None
     return fit
+
+
+def _floor_fit(source, source_normals, rotation, translation, target, target_normals, gate):
+    """Height check. Walls stay a match after a lift, so a pose that misses the floor is rejected.
+
+    Returns 0 when this sweep has no floor to check. Returns None when the floor misses.
+    """
+    source_normals = np.asarray(source_normals, dtype=np.float64)
+    target_normals = np.asarray(target_normals, dtype=np.float64)
+    posed = (np.asarray(rotation, dtype=np.float64) @ source_normals.T).T
+    keep = (np.abs(posed[:, 2]) > 0.7) & (np.linalg.norm(source, axis=1) >= MIN_RANGE)
+    stored_keep = np.abs(target_normals[:, 2]) > 0.7
+    if keep.sum() < MIN_PAIRS or stored_keep.sum() < MIN_PAIRS:
+        return 0.0
+    floors = apply_pose(rotation, translation, source[keep])
+    stored = target[stored_keep]
+    paired = correspondences(floors, stored, gate)
+    hits = paired >= 0
+    if hits.sum() < MIN_PAIRS or hits.sum() / len(floors) < 0.45:
+        return None
+    residual = np.sum(
+        target_normals[stored_keep][paired[hits]] * (floors[hits] - stored[paired[hits]]),
+        axis=1,
+    )
+    if float(np.median(np.abs(residual))) > 0.03:
+        return None
+    return float(np.median(np.abs(residual)))
 
 
 def _yaw_matrix(radians):
@@ -586,6 +612,10 @@ class ImuTrack:
         """
         if self.gravity is None or self.origin is None or not self.accel or end < start:
             return None
+        # A skipped sweep used to leave the clock on the old cloud, and the
+        # integral then grew without bound and shoved the pose off the map.
+        if end - start > 0.5:
+            return None
         window = [sample for sample in self.accel if start - 0.05 <= sample[0] <= end + 0.05]
         if len(window) < 2 or window[-1][0] - window[0][0] < 0.5 * (end - start):
             return None
@@ -668,8 +698,12 @@ class Tracker:
         if len(xyz) == 0:
             return "skipped"
         normals = estimate_normals(xyz)
-        if len(self.map) == 0:
-            self.map.insert(xyz, intensity, normals)
+        if len(self.map) < MIN_PAIRS:
+            # A short first packet used to become the whole map. Alignment needs
+            # more than that, so every later sweep was skipped and the count froze.
+            moved = apply_pose(self.rotation, self.translation, xyz)
+            moved_normals = (self.rotation @ normals.T).T
+            self.map.insert(moved, intensity, moved_normals)
             self.last_fit = 0.0
             return "seed"
         # facing is where the lidar is pointed in the map, from the IMU
@@ -684,19 +718,28 @@ class Tracker:
         else:
             guess_rotation = pose_guess(self.rotation, rotation_hint)
         # The last accepted move carries a steady walk. translation_hint is only
-        # the extra acceleration since that cloud, so the two add.
-        guess_translation = np.array(self.translation, dtype=np.float64) + self.step
-        if translation_hint is not None:
-            hint = np.asarray(translation_hint, dtype=np.float64)
-            length = float(np.linalg.norm(hint))
-            if length > 0.4:
-                hint = hint * (0.4 / length)
-            guess_translation = guess_translation + hint
+        # the extra acceleration since that cloud, so the two add. If that guess
+        # misses, try the last pose by itself before giving up on the sweep.
         previous_translation = np.array(self.translation, dtype=np.float64, copy=True)
-        rotation, translation, ok, fit = align_scan(
-            xyz, normals, self.map.xyz(), self.map.normals(),
-            guess_rotation, guess_translation, self.max_correspondence,
-        )
+        rotation = translation = None
+        ok = False
+        fit = None
+        for use_motion in (True, False):
+            guess_translation = np.array(previous_translation, copy=True)
+            if use_motion:
+                guess_translation = guess_translation + self.step
+                if translation_hint is not None:
+                    hint = np.asarray(translation_hint, dtype=np.float64)
+                    length = float(np.linalg.norm(hint))
+                    if length > 0.25:
+                        hint = hint * (0.25 / length)
+                    guess_translation = guess_translation + hint
+            rotation, translation, ok, fit = align_scan(
+                xyz, normals, self.map.xyz(), self.map.normals(),
+                guess_rotation, guess_translation, self.max_correspondence,
+            )
+            if ok:
+                break
         self.last_fit = fit
         if not ok:
             self.step = np.zeros(3)
@@ -704,7 +747,14 @@ class Tracker:
         moved = apply_pose(rotation, translation, xyz)
         moved_normals = (rotation @ normals.T).T
         fresh = self.map.novel_mask(moved)
-        self.step = translation - previous_translation
+        delta = translation - previous_translation
+        length = float(np.linalg.norm(delta))
+        if length < 0.01:
+            self.step = np.zeros(3)
+        elif length > 0.3:
+            self.step = delta * (0.3 / length)
+        else:
+            self.step = delta
         self.rotation = rotation
         self.translation = translation
         self.map.insert(moved[fresh], intensity[fresh], moved_normals[fresh])

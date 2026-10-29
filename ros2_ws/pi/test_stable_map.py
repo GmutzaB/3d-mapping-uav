@@ -242,6 +242,46 @@ class StableMapTests(unittest.TestCase):
     def _moved(self, original, rotation, translation):
         return apply_pose(rotation.T, -rotation.T @ translation, original)
 
+    def test_a_short_first_cloud_does_not_freeze_the_map(self):
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        handful = np.array([
+            [1.0, 0.0, 0.5],
+            [1.1, 0.2, 0.6],
+            [0.9, -0.2, 0.4],
+            [1.2, 0.1, 0.7],
+        ])
+        self.assertEqual(tracker.add_scan(handful), "seed")
+        self.assertEqual(len(tracker.map), 4)
+        original = _room_with_floor()
+        self.assertEqual(tracker.add_scan(original), "seed")
+        self.assertGreater(len(tracker.map), 40)
+        translation = np.array([0.0, 0.0, 0.15])
+        scan = self._moved(original, np.eye(3), translation)
+        self.assertEqual(tracker.add_scan(scan, facing=np.eye(3)), "aligned")
+        np.testing.assert_allclose(tracker.translation, translation, atol=0.05)
+
+    def test_a_lift_is_not_pulled_back_to_the_origin(self):
+        rng = np.random.default_rng(3)
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        tracker.add_scan(original)
+        seed_count = len(tracker.map)
+        translation = np.array([0.0, 0.0, 0.18])
+        scan = self._moved(original, np.eye(3), translation)
+        self.assertEqual(tracker.add_scan(scan, facing=np.eye(3)), "aligned")
+        for _ in range(3):
+            noisy = scan + rng.normal(0, 0.008, scan.shape)
+            self.assertEqual(
+                tracker.add_scan(
+                    noisy,
+                    facing=np.eye(3),
+                    translation_hint=np.array([0.0, 0.0, -0.8]),
+                ),
+                "aligned",
+            )
+            np.testing.assert_allclose(tracker.translation, translation, atol=0.05)
+        self.assertLess(len(tracker.map), seed_count * 1.2)
+
     def test_a_lift_stays_on_one_room(self):
         original = _room_with_floor()
         tracker = Tracker(voxel=0.05, max_correspondence=0.45)
