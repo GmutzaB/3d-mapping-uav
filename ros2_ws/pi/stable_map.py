@@ -5,6 +5,8 @@ The first cloud is the map. Each later cloud is pulled onto those surfaces
 (so a wall stays one wall) and only points that see new space are added.
 The IMU orientation is the direction the lidar is actually facing, measured
 from that first cloud. The gyro turn is used only when the orientation is missing.
+Lifting and walking are tracked too: the accelerometer supplies the move since
+the last cloud, and the floor and walls pull that guess back into place.
 
 Leave the lidar launch running, then:
 
@@ -195,8 +197,11 @@ def align_scan(source, source_normals, target, target_normals, rotation, transla
     chosen = stride_index(len(source), SOURCE_CAP)
     source = source[chosen]
     source_normals = source_normals[chosen]
-    current_rotation, current_translation, yaw_ok = _yaw_search(
+    current_translation = _shift_search(
         source, source_normals, target, target_normals, rotation, translation, max_distance
+    )
+    current_rotation, current_translation, yaw_ok = _yaw_search(
+        source, source_normals, target, target_normals, rotation, current_translation, max_distance
     )
     if not yaw_ok:
         return rotation, translation, False, None
@@ -250,6 +255,73 @@ def _wall_points(points, normals, min_range):
     if keep.sum() < MIN_PAIRS:
         return None
     return points[keep]
+
+
+def _floor_points(points, normals, min_range, rotation=None):
+    """Horizontal surfaces. A vertical wall looks the same after a lift, so only these observe height."""
+    points = np.asarray(points, dtype=np.float64)
+    normals = np.asarray(normals, dtype=np.float64)
+    if len(points) == 0:
+        return None
+    if rotation is not None:
+        normals = (np.asarray(rotation, dtype=np.float64) @ normals.T).T
+    keep = (np.abs(normals[:, 2]) > 0.7) & (np.linalg.norm(points, axis=1) >= min_range)
+    if keep.sum() < MIN_PAIRS:
+        return None
+    return points[keep]
+
+
+def _shift_search(source, source_normals, target, target_normals, rotation, translation, max_distance):
+    """Move the guess up, down, and sideways until the floor and the walls agree.
+
+    The prior is only where the lidar was. A lift larger than the match gate
+    then has no correspondences, the sweep is dropped, and the cloud stays put.
+    Ties keep the smaller move so a flat floor cannot slide the room.
+    """
+    gate = max(0.08, min(0.12, max_distance * 0.35))
+    probe_wall = _wall_points(source, source_normals, MIN_RANGE)
+    probe_floor = _floor_points(source, source_normals, MIN_RANGE, rotation)
+    stored_wall = _wall_points(target, target_normals, 0.0)
+    stored_floor = _floor_points(target, target_normals, 0.0)
+    if probe_wall is not None:
+        probe_wall = probe_wall[stride_index(len(probe_wall), 400)]
+    if probe_floor is not None:
+        probe_floor = probe_floor[stride_index(len(probe_floor), 400)]
+    if stored_wall is not None:
+        stored_wall = stored_wall[stride_index(len(stored_wall), 800)]
+    if stored_floor is not None:
+        stored_floor = stored_floor[stride_index(len(stored_floor), 800)]
+    if probe_floor is None or stored_floor is None:
+        return np.array(translation, dtype=np.float64, copy=True)
+
+    def score(shift):
+        total = 0
+        if probe_wall is not None and stored_wall is not None:
+            total += _inlier_count(probe_wall, stored_wall, rotation, shift, gate)
+        total += _inlier_count(probe_floor, stored_floor, rotation, shift, gate)
+        return total
+
+    translation = np.asarray(translation, dtype=np.float64)
+    best_shift = np.array(translation, copy=True)
+    best_score = score(best_shift)
+    best_size = 0.0
+    offsets = [(0.0, 0.0, 0.0)]
+    for meters in (0.12, 0.25, 0.40):
+        offsets.extend((
+            (0.0, 0.0, meters), (0.0, 0.0, -meters),
+            (meters, 0.0, 0.0), (-meters, 0.0, 0.0),
+            (0.0, meters, 0.0), (0.0, -meters, 0.0),
+        ))
+    for offset in offsets[1:]:
+        shift = translation + np.array(offset)
+        found = score(shift)
+        size = float(np.linalg.norm(offset))
+        closer = found == best_score and size < best_size
+        if found > best_score or closer:
+            best_score = found
+            best_size = size
+            best_shift = shift
+    return best_shift
 
 
 def _yaw_search(source, source_normals, target, target_normals, rotation, translation, max_distance):
@@ -460,8 +532,10 @@ class ImuTrack:
 
     def __init__(self):
         self.samples = []
+        self.accel = []
         self.orientation = None
         self.origin = None
+        self.gravity = None
 
     def push(self, stamp, gyro):
         gyro = np.asarray(gyro, dtype=np.float64)
@@ -479,10 +553,64 @@ class ImuTrack:
             return
         self.orientation = rotation
 
+    def push_accel(self, stamp, accel):
+        """Specific force in the body frame, with the orientation at that moment."""
+        accel = np.asarray(accel, dtype=np.float64)
+        if accel.shape != (3,) or not np.all(np.isfinite(accel)) or self.orientation is None:
+            return
+        self.accel.append((float(stamp), accel, np.array(self.orientation, copy=True)))
+        cutoff = float(stamp) - 2.0
+        while len(self.accel) > 2 and self.accel[0][0] < cutoff:
+            self.accel.pop(0)
+
     def lock_origin(self):
         """Remember the facing at the first cloud. Later clouds are measured from it."""
         if self.origin is None and self.orientation is not None:
             self.origin = np.array(self.orientation, copy=True)
+
+    def lock_gravity(self):
+        """The still reading, in the map, is gravity. Later moves are measured from it."""
+        if self.gravity is not None or self.origin is None or len(self.accel) < 5:
+            return
+        samples = [self.origin.T @ rotation @ accel for _, accel, rotation in self.accel]
+        self.gravity = np.mean(samples, axis=0)
+
+    def _map_accel(self, accel, rotation):
+        return self.origin.T @ rotation @ np.asarray(accel, dtype=np.float64) - self.gravity
+
+    def shift_since(self, start, end):
+        """Map displacement from the accelerometer, or None when gravity or the gap is missing.
+
+        Velocity starts at rest at ``start``. Steady speed is carried by the last
+        accepted move; this integral is only the extra acceleration in the gap.
+        """
+        if self.gravity is None or self.origin is None or not self.accel or end < start:
+            return None
+        window = [sample for sample in self.accel if start - 0.05 <= sample[0] <= end + 0.05]
+        if len(window) < 2 or window[-1][0] - window[0][0] < 0.5 * (end - start):
+            return None
+        position = np.zeros(3)
+        velocity = np.zeros(3)
+        previous_time = start
+        accel = self._map_accel(window[0][1], window[0][2])
+        for stamp, sample, rotation in window:
+            if stamp < start:
+                accel = self._map_accel(sample, rotation)
+                continue
+            if stamp > end:
+                break
+            step = stamp - previous_time
+            if step > 0:
+                position = position + velocity * step + 0.5 * accel * step * step
+                velocity = velocity + accel * step
+            previous_time = stamp
+            accel = self._map_accel(sample, rotation)
+        tail = end - previous_time
+        if tail > 0:
+            position = position + velocity * tail + 0.5 * accel * tail * tail
+        if not np.all(np.isfinite(position)) or np.linalg.norm(position) > 0.75:
+            return None
+        return position
 
     def facing_in_map(self):
         """Map-from-lidar rotation since the first cloud, or None if it is not known."""
@@ -526,9 +654,10 @@ class Tracker:
         self.map = StableMap(self.voxel)
         self.rotation = np.eye(3)
         self.translation = np.zeros(3)
+        self.step = np.zeros(3)
         self.last_fit = None
 
-    def add_scan(self, xyz, intensity=None, rotation_hint=None, facing=None):
+    def add_scan(self, xyz, intensity=None, rotation_hint=None, facing=None, translation_hint=None):
         xyz = np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
         if intensity is None:
             intensity = np.ones(len(xyz), dtype=np.float64)
@@ -554,16 +683,28 @@ class Tracker:
             guess_rotation = np.array(self.rotation, dtype=np.float64, copy=True)
         else:
             guess_rotation = pose_guess(self.rotation, rotation_hint)
+        # The last accepted move carries a steady walk. translation_hint is only
+        # the extra acceleration since that cloud, so the two add.
+        guess_translation = np.array(self.translation, dtype=np.float64) + self.step
+        if translation_hint is not None:
+            hint = np.asarray(translation_hint, dtype=np.float64)
+            length = float(np.linalg.norm(hint))
+            if length > 0.4:
+                hint = hint * (0.4 / length)
+            guess_translation = guess_translation + hint
+        previous_translation = np.array(self.translation, dtype=np.float64, copy=True)
         rotation, translation, ok, fit = align_scan(
             xyz, normals, self.map.xyz(), self.map.normals(),
-            guess_rotation, self.translation, self.max_correspondence,
+            guess_rotation, guess_translation, self.max_correspondence,
         )
         self.last_fit = fit
         if not ok:
+            self.step = np.zeros(3)
             return "skipped"
         moved = apply_pose(rotation, translation, xyz)
         moved_normals = (rotation @ normals.T).T
         fresh = self.map.novel_mask(moved)
+        self.step = translation - previous_translation
         self.rotation = rotation
         self.translation = translation
         self.map.insert(moved[fresh], intensity[fresh], moved_normals[fresh])
@@ -595,6 +736,11 @@ def collect(seconds_between_saves, topic, imu_topic, output, voxel, max_correspo
         ])
         imu.push_orientation([
             msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w
+        ])
+        imu.push_accel(stamp, [
+            msg.linear_acceleration.x,
+            msg.linear_acceleration.y,
+            msg.linear_acceleration.z,
         ])
 
     node.create_subscription(PointCloud2, topic, on_cloud, qos_profile_sensor_data)
@@ -633,8 +779,10 @@ def collect(seconds_between_saves, topic, imu_topic, output, voxel, max_correspo
                 intensity = np.ones(len(xyz))
             stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
             delta = None
+            shift = None
             if last_stamp is not None:
                 delta = imu.rotation_since(last_stamp, stamp)
+                shift = imu.shift_since(last_stamp, stamp)
             # The map frame is the IMU frame of the cloud that actually seeds it.
             # If that quaternion arrives one cloud late, adopt it only while the
             # lidar is still at the start. A later quaternion must not redefine
@@ -647,9 +795,13 @@ def collect(seconds_between_saves, topic, imu_topic, output, voxel, max_correspo
             ):
                 imu.lock_origin()
             facing = None if len(tracker.map) == 0 else imu.facing_in_map()
-            status = tracker.add_scan(xyz, intensity, rotation_hint=delta, facing=facing)
+            status = tracker.add_scan(
+                xyz, intensity, rotation_hint=delta, facing=facing, translation_hint=shift,
+            )
             if status == "seed":
                 imu.lock_origin()
+            if imu.gravity is None and np.linalg.norm(tracker.translation) < 0.02:
+                imu.lock_gravity()
             if status != "skipped":
                 last_stamp = stamp
             counts[status] += 1

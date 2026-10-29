@@ -72,6 +72,16 @@ def yaw(radians):
     return np.array([[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]])
 
 
+def pitch(radians):
+    cosine, sine = np.cos(radians), np.sin(radians)
+    return np.array([[cosine, 0.0, sine], [0.0, 1.0, 0.0], [-sine, 0.0, cosine]])
+
+
+def _rotation_error(left, right):
+    cosine = np.clip((np.trace(left.T @ right) - 1.0) * 0.5, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cosine)))
+
+
 class StableMapTests(unittest.TestCase):
     def test_default_spacing_is_a_few_millimetres(self):
         tracker = Tracker()
@@ -228,6 +238,106 @@ class StableMapTests(unittest.TestCase):
         scan = apply_pose(yaw(np.deg2rad(15)).T, np.zeros(3), original)
         self.assertEqual(tracker.add_scan(scan, rotation_hint=yaw(np.deg2rad(80))), "aligned")
         self.assertAlmostEqual(heading_deg(tracker.rotation), 15, delta=8)
+
+    def _moved(self, original, rotation, translation):
+        return apply_pose(rotation.T, -rotation.T @ translation, original)
+
+    def test_a_lift_stays_on_one_room(self):
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        self.assertEqual(tracker.add_scan(original), "seed")
+        seed_count = len(tracker.map)
+        translation = np.array([0.0, 0.0, 0.22])
+        scan = self._moved(original, np.eye(3), translation)
+        self.assertEqual(tracker.add_scan(scan, facing=np.eye(3)), "aligned")
+        np.testing.assert_allclose(tracker.translation, translation, atol=0.04)
+        self.assertLess(len(tracker.map), seed_count * 1.15)
+        floor = tracker.map.xyz()
+        floor = floor[floor[:, 2] < 0.05]
+        self.assertLess(np.median(np.abs(floor[:, 2])), 0.02)
+
+    def test_walking_and_lifting_follow_the_lidar(self):
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        tracker.add_scan(original)
+        seed_count = len(tracker.map)
+        poses = (
+            (np.eye(3), np.array([0.00, 0.00, 0.15])),
+            (np.eye(3), np.array([0.16, 0.00, 0.30])),
+            (yaw(np.deg2rad(25)), np.array([0.28, -0.08, 0.42])),
+            (pitch(np.deg2rad(12)), np.array([0.28, -0.08, 0.20])),
+        )
+        for rotation, translation in poses:
+            scan = self._moved(original, rotation, translation)
+            self.assertEqual(
+                tracker.add_scan(scan, facing=rotation),
+                "aligned",
+            )
+            np.testing.assert_allclose(tracker.translation, translation, atol=0.05)
+            self.assertLess(_rotation_error(tracker.rotation, rotation), 8.0)
+        cloud = tracker.map.xyz()
+        self.assertLess(len(cloud), seed_count * 1.25)
+        walls = cloud[(cloud[:, 2] > 0.05) & (np.linalg.norm(cloud[:, :2], axis=1) > 1.2)]
+        self.assertLess(np.percentile(_wall_gap(walls), 90), 0.08)
+        floor = cloud[np.abs(cloud[:, 2]) < 0.08]
+        self.assertGreater(len(floor), 40)
+
+    def test_a_turn_while_lifting_does_not_need_a_perfect_guess(self):
+        # This used to be dropped: the guess stayed at the origin, and the
+        # combined turn and step was too far for the match gate.
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        tracker.add_scan(original)
+        seed_count = len(tracker.map)
+        rotation = yaw(np.deg2rad(40))
+        translation = np.array([0.20, 0.10, 0.25])
+        scan = self._moved(original, rotation, translation)
+        self.assertEqual(tracker.add_scan(scan, facing=rotation), "aligned")
+        np.testing.assert_allclose(tracker.translation, translation, atol=0.05)
+        self.assertLess(len(tracker.map), seed_count * 1.15)
+
+    def test_steady_motion_is_carried_to_the_next_sweep(self):
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.2)
+        tracker.add_scan(original)
+        first = np.array([0.0, 0.0, 0.12])
+        self.assertEqual(
+            tracker.add_scan(self._moved(original, np.eye(3), first), facing=np.eye(3)),
+            "aligned",
+        )
+        # The next lift is 0.25 m, past the 0.2 m match distance from the last
+        # pose. The carried step puts the guess close enough to seat it.
+        second = np.array([0.0, 0.0, 0.37])
+        self.assertEqual(
+            tracker.add_scan(self._moved(original, np.eye(3), second), facing=np.eye(3)),
+            "aligned",
+        )
+        np.testing.assert_allclose(tracker.translation, second, atol=0.05)
+
+    def test_a_wrong_lift_hint_does_not_raise_the_floor(self):
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        tracker.add_scan(original)
+        translation = np.array([0.0, 0.0, 0.05])
+        scan = self._moved(original, np.eye(3), translation)
+        self.assertEqual(
+            tracker.add_scan(scan, facing=np.eye(3), translation_hint=np.array([0.0, 0.0, 0.8])),
+            "aligned",
+        )
+        np.testing.assert_allclose(tracker.translation, translation, atol=0.05)
+
+    def test_accel_integration_removes_gravity(self):
+        imu = ImuTrack()
+        imu.push_orientation((0.0, 0.0, 0.0, 1.0))
+        for step in range(10):
+            imu.push_accel(step * 0.05, (0.0, 0.0, 9.81))
+        imu.lock_origin()
+        imu.lock_gravity()
+        np.testing.assert_allclose(imu.gravity, (0.0, 0.0, 9.81), atol=1e-6)
+        for step in range(11):
+            imu.push_accel(1.0 + step * 0.05, (0.0, 0.0, 11.81))
+        shift = imu.shift_since(1.0, 1.5)
+        np.testing.assert_allclose(shift, (0.0, 0.0, 0.25), atol=0.02)
 
     def test_gyro_integration_tracks_a_steady_turn(self):
         imu = ImuTrack()
