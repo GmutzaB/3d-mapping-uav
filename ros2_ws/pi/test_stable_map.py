@@ -358,6 +358,35 @@ class StableMapTests(unittest.TestCase):
         )
         np.testing.assert_allclose(tracker.translation, second, atol=0.05)
 
+    def test_holding_still_after_a_move_locks_on(self):
+        # The guess stays at the start, and this pose is not on the old axis
+        # samples. The same cloud is then repeated. Those repeats have to align
+        # at the new spot instead of skipping forever.
+        rng = np.random.default_rng(11)
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        tracker.add_scan(original)
+        translation = np.array([0.62, -0.48, 0.27])
+        scan = self._moved(original, np.eye(3), translation)
+        self.assertEqual(tracker.add_scan(scan, facing=np.eye(3)), "aligned")
+        np.testing.assert_allclose(tracker.translation, translation, atol=0.08)
+        for _ in range(3):
+            noisy = scan + rng.normal(0, 0.008, scan.shape)
+            self.assertEqual(tracker.add_scan(noisy, facing=np.eye(3)), "aligned")
+            np.testing.assert_allclose(tracker.translation, translation, atol=0.08)
+        self.assertLess(len(tracker.map), len(original) * 2)
+
+    def test_a_move_a_metre_away_is_found_when_the_lidar_stops(self):
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        tracker.add_scan(original)
+        translation = np.array([1.15, 0.85, 0.0])
+        scan = self._moved(original, np.eye(3), translation)
+        self.assertEqual(tracker.add_scan(scan, facing=np.eye(3)), "aligned")
+        np.testing.assert_allclose(tracker.translation, translation, atol=0.1)
+        self.assertEqual(tracker.add_scan(scan, facing=np.eye(3)), "aligned")
+        np.testing.assert_allclose(tracker.translation, translation, atol=0.1)
+
     def test_a_wrong_lift_hint_does_not_raise_the_floor(self):
         original = _room_with_floor()
         tracker = Tracker(voxel=0.05, max_correspondence=0.45)
@@ -528,8 +557,9 @@ class StableMapTests(unittest.TestCase):
         missed = Tracker(voxel=0.05, max_correspondence=0.2)
         missed.add_scan(original)
         missed.add_scan(self._moved(original, np.eye(3), first), facing=np.eye(3))
+        # Past the area searched around the last pose. That sweep stays dropped.
         self.assertEqual(
-            missed.add_scan(self._moved(original, np.eye(3), second), facing=np.eye(3)),
+            missed.add_scan(self._moved(original, np.eye(3), np.array([4.0, 0.0, 0.0])), facing=np.eye(3)),
             "skipped",
         )
         carried = tracker.speed * 4.0

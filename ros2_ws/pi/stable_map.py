@@ -9,6 +9,8 @@ The IMU orientation is the direction the lidar is actually facing, measured
 from that first cloud. The gyro turn is used only when the orientation is missing.
 The move since the last kept sweep comes from the IMU's own clock (the cloud
 stamp is a different clock) plus the speed of the last sweep that lined up.
+If that guess misses, the sweep is tried again within about 2 m. Holding the
+lidar still at the new spot can lock on, instead of skipping forever.
 The floor and walls pull that guess back into place.
 
 Leave the lidar launch running, then:
@@ -37,6 +39,9 @@ SURFACE_MATCH = 0.02
 # How far one sweep's guess may move. A drone covers this between scans; the
 # walls still have to agree before the pose is kept.
 STEP_LIMIT = 1.0
+# After the guess misses, look this far around it. Holding the lidar still at
+# the new spot has to be found again, or every later sweep stays skipped.
+REACQUIRE_RADIUS = 2.0
 IMU_HISTORY = 4.0
 MOTION_GAP = 3.0
 
@@ -222,6 +227,9 @@ def align_scan(source, source_normals, target, target_normals, rotation, transla
     its yaw, and the returned rotation is the one that must be kept for the next spin.
     Floor points match at every heading, so only upright surfaces are allowed to
     accept a pose. Accepting on the floor draws the walls again as rays.
+    If the guess misses, other positions within a couple of metres are tried.
+    A sweep that then sits still at the new spot can lock on instead of skipping
+    forever from the place the lidar used to be.
     """
     rotation = np.array(rotation, dtype=np.float64, copy=True)
     translation = np.array(translation, dtype=np.float64, copy=True)
@@ -237,11 +245,28 @@ def align_scan(source, source_normals, target, target_normals, rotation, transla
     chosen = stride_index(len(source), SOURCE_CAP)
     source = source[chosen]
     source_normals = source_normals[chosen]
-    current_translation = _shift_search(
-        source, source_normals, target, target_normals, rotation, translation, max_distance
+    found = _refine(
+        source, source_normals, target, target_normals,
+        rotation, translation, max_distance, iterations,
     )
+    if found[2]:
+        return found
+    for shift in _reacquire_translations(
+        source, source_normals, target, target_normals, rotation, translation
+    ):
+        found = _refine(
+            source, source_normals, target, target_normals,
+            rotation, shift, max_distance, iterations,
+        )
+        if found[2]:
+            return found
+    return rotation, translation, False, None
+
+
+def _refine(source, source_normals, target, target_normals, rotation, translation, max_distance, iterations):
+    """Yaw search, plane steps, then the wall and floor test. No position jump."""
     current_rotation, current_translation, yaw_ok = _yaw_search(
-        source, source_normals, target, target_normals, rotation, current_translation, max_distance
+        source, source_normals, target, target_normals, rotation, translation, max_distance
     )
     if not yaw_ok:
         return rotation, translation, False, None
@@ -313,61 +338,79 @@ def _floor_points(points, normals, min_range, rotation=None):
     return points[keep]
 
 
-def _shift_search(source, source_normals, target, target_normals, rotation, translation, max_distance):
-    """Move the guess up, down, and sideways until the floor and the walls agree.
+def _reacquire_translations(source, source_normals, target, target_normals, rotation, translation):
+    """Positions around the guess worth a full alignment.
 
-    The prior is only where the lidar was. A lift larger than the match gate
-    then has no correspondences, the sweep is dropped, and the cloud stays put.
-    Ties keep the smaller move so a flat floor cannot slide the room.
+    The old search only tried a handful of points on the axes, and it gave up
+    unless a floor was visible. A move that landed between those points never
+    matched, and holding the lidar still there skipped forever. Walls pick the
+    horizontal cell. The floor, when this sweep has one, picks the height.
     """
-    gate = max(0.08, min(0.12, max_distance * 0.35))
     probe_wall = _wall_points(source, source_normals, MIN_RANGE)
-    probe_floor = _floor_points(source, source_normals, MIN_RANGE, rotation)
     stored_wall = _wall_points(target, target_normals, 0.0)
+    if probe_wall is None or stored_wall is None:
+        return []
+    probe_wall = probe_wall[stride_index(len(probe_wall), 120)]
+    stored_wall = stored_wall[stride_index(len(stored_wall), 400)]
+    probe_floor = _floor_points(source, source_normals, MIN_RANGE, rotation)
     stored_floor = _floor_points(target, target_normals, 0.0)
-    if probe_wall is not None:
-        probe_wall = probe_wall[stride_index(len(probe_wall), 400)]
     if probe_floor is not None:
-        probe_floor = probe_floor[stride_index(len(probe_floor), 400)]
-    if stored_wall is not None:
-        stored_wall = stored_wall[stride_index(len(stored_wall), 800)]
+        probe_floor = probe_floor[stride_index(len(probe_floor), 120)]
     if stored_floor is not None:
-        stored_floor = stored_floor[stride_index(len(stored_floor), 800)]
-    if probe_floor is None or stored_floor is None:
-        return np.array(translation, dtype=np.float64, copy=True)
+        stored_floor = stored_floor[stride_index(len(stored_floor), 400)]
+    center = np.asarray(translation, dtype=np.float64)
 
-    def score(shift):
-        total = 0
-        if probe_wall is not None and stored_wall is not None:
-            total += _inlier_count(probe_wall, stored_wall, rotation, shift, gate)
-        total += _inlier_count(probe_floor, stored_floor, rotation, shift, gate)
-        return total
+    def wall_score(shift, gate):
+        return _inlier_count(probe_wall, stored_wall, rotation, shift, gate)
 
-    translation = np.asarray(translation, dtype=np.float64)
-    best_shift = np.array(translation, copy=True)
-    best_score = score(best_shift)
-    # A point or two of noise used to win a 12 cm jump, and the next sweep
-    # then scored the origin higher and put the lidar back at 0, 0, 0.
-    margin = max(25, int(0.08 * max(best_score, 1)))
-    offsets = []
-    for meters in (0.12, 0.25, 0.40, 0.60, 0.90):
-        offsets.extend((
-            (0.0, 0.0, meters), (0.0, 0.0, -meters),
-            (meters, 0.0, 0.0), (-meters, 0.0, 0.0),
-            (0.0, meters, 0.0), (0.0, -meters, 0.0),
-        ))
-    for meters in (0.45, 0.75):
-        offsets.extend((
-            (meters, meters, 0.0), (meters, -meters, 0.0),
-            (-meters, meters, 0.0), (-meters, -meters, 0.0),
-        ))
-    for offset in offsets:
-        shift = translation + np.array(offset)
-        found = score(shift)
-        if found >= best_score + margin:
-            best_score = found
-            best_shift = shift
-    return best_shift
+    def floor_score(shift, gate):
+        if probe_floor is None or stored_floor is None:
+            return 0
+        return _inlier_count(probe_floor, stored_floor, rotation, shift, gate)
+
+    def closer(shift):
+        return float(np.linalg.norm(shift - center))
+
+    coarse = np.arange(-REACQUIRE_RADIUS, REACQUIRE_RADIUS + 1e-6, 0.5)
+    ranked = []
+    for x in coarse:
+        for y in coarse:
+            shift = center + np.array([x, y, 0.0])
+            ranked.append((wall_score(shift, 0.45), closer(shift), shift))
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    seen = []
+    picks = []
+    for _, _, rough in ranked[:4]:
+        local = []
+        for x in np.arange(-0.5, 0.51, 0.25):
+            for y in np.arange(-0.5, 0.51, 0.25):
+                shift = rough + np.array([x, y, 0.0])
+                # A wide gate calls every nearby cell a tie. The tighter gate
+                # leaves the cell that actually sits on the walls.
+                local.append((wall_score(shift, 0.22), closer(shift), shift))
+        local.sort(key=lambda item: (-item[0], item[1]))
+        shift = local[0][2]
+        heights = (0.0,) if probe_floor is None or stored_floor is None else (
+            -0.6, -0.3, 0.0, 0.3, 0.6
+        )
+        best_shift = np.array([shift[0], shift[1], center[2]])
+        best_key = None
+        for z in heights:
+            trial = np.array([shift[0], shift[1], center[2] + z])
+            score = wall_score(trial, 0.22) + floor_score(trial, 0.22)
+            key = (-score, abs(z))
+            if best_key is None or key < best_key:
+                best_key = key
+                best_shift = trial
+        if np.linalg.norm(best_shift - center) < 0.08:
+            continue
+        if any(np.linalg.norm(best_shift - earlier) < 0.2 for earlier in seen):
+            continue
+        seen.append(best_shift)
+        picks.append(best_shift)
+        if len(picks) == 3:
+            break
+    return picks
 
 
 def _yaw_search(source, source_normals, target, target_normals, rotation, translation, max_distance):
