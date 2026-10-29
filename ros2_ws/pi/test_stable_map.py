@@ -5,11 +5,13 @@ import unittest
 import numpy as np
 
 from stable_map import (
+    DEFAULT_VOXEL,
     ImuTrack,
     StableMap,
     Tracker,
     apply_pose,
     heading_deg,
+    novelty_gate,
     pose_guess,
     quat_xyzw_to_rot,
 )
@@ -71,6 +73,23 @@ def yaw(radians):
 
 
 class StableMapTests(unittest.TestCase):
+    def test_default_spacing_is_a_few_millimetres(self):
+        tracker = Tracker()
+        self.assertAlmostEqual(tracker.voxel, 0.0025)
+        self.assertAlmostEqual(tracker.voxel, DEFAULT_VOXEL)
+        self.assertAlmostEqual(novelty_gate(0.0025), 0.0025)
+        self.assertLess(tracker.map.gate, 0.004)
+        self.assertGreater(novelty_gate(0.05), 0.05)
+
+    def test_points_a_few_millimetres_apart_are_both_kept(self):
+        grid = StableMap(0.0025)
+        added = grid.insert([[0.0, 0.0, 0.0], [0.003, 0.0, 0.0]], [1.0, 1.0])
+        self.assertEqual(added, 2)
+        self.assertEqual(grid.insert([[0.001, 0.0, 0.0]], [1.0]), 0)
+        mask = grid.novel_mask([[0.003, 0.003, 0.0], [0.001, 0.0, 0.0]])
+        self.assertTrue(bool(mask[0]))
+        self.assertFalse(bool(mask[1]))
+
     def test_first_point_in_a_voxel_is_kept(self):
         grid = StableMap(0.1)
         added = grid.insert([[0.01, 0.01, 0.01], [0.04, 0.02, 0.0]], [1.0, 9.0])

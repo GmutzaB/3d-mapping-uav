@@ -23,6 +23,8 @@ SOURCE_CAP = 1500
 TARGET_CAP = 3000
 MIN_PAIRS = 40
 MIN_RANGE = 0.4
+# One stored point about every 2.5 mm. Coarser than this was collapsing a room to ~20k points.
+DEFAULT_VOXEL = 0.0025
 
 
 def write_pcd(path: Path, pts: np.ndarray) -> None:
@@ -348,12 +350,25 @@ def _rotation_angle(rotation):
     return float(np.arccos(cosine))
 
 
+def novelty_gate(voxel):
+    """How far a new point must sit from the map before it is stored.
+
+    A fine map uses one cell. The old 5 cm floor was wider than the cell, so
+    later sweeps could not fill anything closer than 5 cm and the cloud stayed sparse.
+    Coarser maps keep a wider margin so a shaky sweep does not paint a second wall.
+    """
+    voxel = float(voxel)
+    if voxel <= 0.01:
+        return voxel
+    return max(voxel * 2.5, 0.05)
+
+
 class StableMap:
     """Voxel map. The first point to claim a voxel is kept, and nearby points are not layered on it."""
 
     def __init__(self, voxel):
         self.voxel = float(voxel)
-        self.gate = max(self.voxel * 2.5, 0.05)
+        self.gate = novelty_gate(self.voxel)
         self.occupied = set()
         self._bins = {}
         self._capacity = 0
@@ -505,7 +520,7 @@ class ImuTrack:
 class Tracker:
     """Align each sweep to the map planes, then add only points that see new space."""
 
-    def __init__(self, voxel=0.02, max_correspondence=0.4):
+    def __init__(self, voxel=DEFAULT_VOXEL, max_correspondence=0.4):
         self.voxel = float(voxel)
         self.max_correspondence = float(max_correspondence)
         self.map = StableMap(self.voxel)
@@ -585,7 +600,7 @@ def collect(seconds_between_saves, topic, imu_topic, output, voxel, max_correspo
     node.create_subscription(PointCloud2, topic, on_cloud, qos_profile_sensor_data)
     node.create_subscription(Imu, imu_topic, on_imu, qos_profile_sensor_data)
     print(
-        f"mapping {topic} into {output} at {voxel * 100:.0f} cm voxels — walk slowly",
+        f"mapping {topic} into {output} with about {voxel * 1000:.1f} mm between points — walk slowly",
         flush=True,
     )
 
@@ -668,7 +683,12 @@ def main():
     parser.add_argument("--topic", default="/unilidar/cloud")
     parser.add_argument("--imu-topic", default="/unilidar/imu")
     parser.add_argument("--output", default=str(Path.home() / "map.pcd"))
-    parser.add_argument("--voxel", type=float, default=0.02, help="map cell size in meters")
+    parser.add_argument(
+        "--voxel",
+        type=float,
+        default=DEFAULT_VOXEL,
+        help="spacing between stored points, in meters (default 2.5 mm)",
+    )
     parser.add_argument(
         "--max-correspondence",
         type=float,

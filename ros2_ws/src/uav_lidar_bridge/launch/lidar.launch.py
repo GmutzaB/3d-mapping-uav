@@ -19,7 +19,9 @@ def generate_launch_description():
             'use_system_timestamp': True,
             'range_min': 0.0,
             'range_max': arg('range_max', float),
-            'cloud_scan_num': 18,
+            # Each UDP packet is one line of up to 300 returns. 18 lines was a thin
+            # slice, so a sweep threw away most of the spin before the map saw it.
+            'cloud_scan_num': arg('cloud_scan_num', int),
             'lidar_ip': arg('lidar_ip', str),
             'lidar_port': 6101,
             'local_ip': arg('local_ip', str),
@@ -36,5 +38,10 @@ def generate_launch_description():
         DeclareLaunchArgument('local_ip', default_value='192.168.1.2',
                               description="Pi Ethernet address the L2 sends to"),
         DeclareLaunchArgument('range_max', default_value='30.0'),
+        DeclareLaunchArgument(
+            'cloud_scan_num',
+            default_value='72',
+            description='UDP packets merged into each cloud. Higher keeps more of each spin.',
+        ),
         driver,
     ])
