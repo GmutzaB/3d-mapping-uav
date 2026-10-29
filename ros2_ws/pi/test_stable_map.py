@@ -4,7 +4,15 @@ import unittest
 
 import numpy as np
 
-from stable_map import ImuTrack, StableMap, Tracker, apply_pose, heading_deg, pose_guess
+from stable_map import (
+    ImuTrack,
+    StableMap,
+    Tracker,
+    apply_pose,
+    heading_deg,
+    pose_guess,
+    quat_xyzw_to_rot,
+)
 
 
 def corner(seed=0):
@@ -208,6 +216,95 @@ class StableMapTests(unittest.TestCase):
         for step in range(11):
             imu.push(step * 0.1, rate)
         np.testing.assert_allclose(imu.rotation_since(0.0, 1.0), yaw(np.deg2rad(90)), atol=1e-6)
+
+    def test_quaternion_yaw_is_the_heading(self):
+        half = np.sqrt(0.5)
+        rotation = quat_xyzw_to_rot((0.0, 0.0, half, half))
+        self.assertAlmostEqual(heading_deg(rotation), 90.0, delta=1e-6)
+        np.testing.assert_allclose(rotation, yaw(np.deg2rad(90)), atol=1e-6)
+        self.assertIsNone(quat_xyzw_to_rot((0.0, 0.0, 0.0, 0.0)))
+
+    def test_facing_is_the_turn_since_the_map_started(self):
+        imu = ImuTrack()
+        imu.push_orientation((0.0, 0.0, 0.0, 1.0))
+        self.assertIsNone(imu.facing_in_map())
+        imu.lock_origin()
+        self.assertAlmostEqual(heading_deg(imu.facing_in_map()), 0.0, delta=1e-6)
+        half = np.deg2rad(20.0)
+        imu.push_orientation((0.0, 0.0, np.sin(half), np.cos(half)))
+        self.assertAlmostEqual(heading_deg(imu.facing_in_map()), 40.0, delta=1e-4)
+        imu.push_orientation((0.0, 0.0, 0.0, 0.0))
+        self.assertAlmostEqual(heading_deg(imu.facing_in_map()), 40.0, delta=1e-4)
+
+    def test_reported_facing_places_a_turned_room_once(self):
+        # The gyro reports no turn. The quaternion says the lidar has faced 40
+        # degrees since the first cloud. The walls must land once, at that heading.
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        self.assertEqual(tracker.add_scan(original), "seed")
+        seed_count = len(tracker.map)
+        scan = apply_pose(yaw(np.deg2rad(40)).T, np.zeros(3), original)
+        self.assertEqual(
+            tracker.add_scan(scan, rotation_hint=np.eye(3), facing=yaw(np.deg2rad(40))),
+            "aligned",
+        )
+        self.assertAlmostEqual(heading_deg(tracker.rotation), 40, delta=6)
+        self.assertLess(len(tracker.map), seed_count * 1.15)
+        cloud = tracker.map.xyz()
+        walls = cloud[(cloud[:, 2] > 0.05) & (np.linalg.norm(cloud[:, :2], axis=1) > 1.2)]
+        self.assertLess(np.percentile(_wall_gap(walls), 90), 0.08)
+
+    def test_facing_is_not_stacked_on_the_previous_yaw(self):
+        original = _room()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        tracker.add_scan(original)
+        seed_count = len(tracker.map)
+        first = apply_pose(yaw(np.deg2rad(20)).T, np.zeros(3), original)
+        self.assertEqual(tracker.add_scan(first, facing=yaw(np.deg2rad(20))), "aligned")
+        self.assertAlmostEqual(heading_deg(tracker.rotation), 20, delta=6)
+        # Absolute facing is 55, and the gyro missed the extra turn. Adding the
+        # 55 on top of the stored 20 would draw a second room.
+        second = apply_pose(yaw(np.deg2rad(55)).T, np.zeros(3), original)
+        self.assertEqual(
+            tracker.add_scan(second, rotation_hint=np.eye(3), facing=yaw(np.deg2rad(55))),
+            "aligned",
+        )
+        self.assertAlmostEqual(heading_deg(tracker.rotation), 55, delta=6)
+        self.assertLess(len(tracker.map), seed_count * 1.25)
+
+    def test_quaternion_facing_keeps_one_room_through_a_half_turn(self):
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        imu = ImuTrack()
+        imu.push_orientation((0.0, 0.0, 0.0, 1.0))
+        self.assertEqual(tracker.add_scan(original, facing=None), "seed")
+        imu.lock_origin()
+        seed_count = len(tracker.map)
+        for degrees in (40, 90, 180):
+            half = np.deg2rad(degrees / 2.0)
+            imu.push_orientation((0.0, 0.0, np.sin(half), np.cos(half)))
+            scan = apply_pose(yaw(np.deg2rad(degrees)).T, np.zeros(3), original)
+            status = tracker.add_scan(
+                scan, rotation_hint=np.eye(3), facing=imu.facing_in_map()
+            )
+            self.assertEqual(status, "aligned")
+            wrapped = (heading_deg(tracker.rotation) - degrees + 180.0) % 360.0 - 180.0
+            self.assertLess(abs(wrapped), 6.0)
+        cloud = tracker.map.xyz()
+        self.assertLess(len(cloud), seed_count * 1.2)
+        walls = cloud[(cloud[:, 2] > 0.05) & (np.linalg.norm(cloud[:, :2], axis=1) > 1.2)]
+        self.assertLess(np.percentile(_wall_gap(walls), 90), 0.08)
+
+    def test_a_wrong_facing_does_not_override_the_walls(self):
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        tracker.add_scan(original)
+        scan = apply_pose(yaw(np.deg2rad(15)).T, np.zeros(3), original)
+        self.assertEqual(
+            tracker.add_scan(scan, facing=yaw(np.deg2rad(80))),
+            "aligned",
+        )
+        self.assertAlmostEqual(heading_deg(tracker.rotation), 15, delta=8)
 
 
 if __name__ == "__main__":

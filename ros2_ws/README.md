@@ -84,7 +84,7 @@ Wait until it stays up without exiting. Check it from anywhere else with `ros2 t
 python3 ~/3d-mapping-uav/ros2_ws/pi/stable_map.py
 ```
 
-Hold the lidar still for about 2 seconds, then turn slowly. `yaw=` is the map heading and should climb as you face a new direction. `dIMU=` is the gyro turn on that spin. One room should stay put. `skipped` means that sweep did not land on the map, so pause instead of walking on. Ctrl-C writes `~/map.pcd` (it is also rewritten every 5 seconds). Copy it to a computer and open it in CloudCompare:
+Hold the lidar still for about 2 seconds, then turn slowly. `yaw=` is the map heading and should climb as you face a new direction. `face=` is the direction the IMU says the lidar is actually facing since the first cloud, and each spin is lined up to it. `dIMU=` is the gyro turn on that spin, used when `face=` is `--`. One room should stay put. `skipped` means that sweep did not land on the map, so pause instead of walking on. Ctrl-C writes `~/map.pcd` (it is also rewritten every 5 seconds). Copy it to a computer and open it in CloudCompare:
 
 ```sh
 scp mtbf@mtbf:~/map.pcd .

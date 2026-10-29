@@ -3,7 +3,8 @@
 
 The first cloud is the map. Each later cloud is pulled onto those surfaces
 (so a wall stays one wall) and only points that see new space are added.
-The last spin's pose is kept. The lidar IMU supplies only the turn since that spin.
+The IMU orientation is the direction the lidar is actually facing, measured
+from that first cloud. The gyro turn is used only when the orientation is missing.
 
 Leave the lidar launch running, then:
 
@@ -143,8 +144,28 @@ def heading_deg(rotation):
     return float(np.degrees(np.arctan2(rotation[1, 0], rotation[0, 0])))
 
 
+def quat_xyzw_to_rot(quat):
+    """Body-to-parent rotation from a ROS quaternion (x, y, z, w).
+
+    The Unitree driver copies quaternion[0..3] into orientation x, y, z, w.
+    A zero quaternion means the orientation has not been reported yet.
+    """
+    quat = np.asarray(quat, dtype=np.float64).reshape(-1)
+    if quat.shape != (4,) or not np.all(np.isfinite(quat)):
+        return None
+    norm = np.linalg.norm(quat)
+    if norm < 1e-6:
+        return None
+    x, y, z, w = quat / norm
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
 def pose_guess(previous_rotation, imu_delta):
-    """Last ICP pose, plus this spin's IMU turn. Never an absolute IMU heading."""
+    """Last ICP pose, plus this spin's gyro turn. Not an absolute heading."""
     if imu_delta is None:
         return np.array(previous_rotation, dtype=np.float64, copy=True)
     return previous_rotation @ imu_delta
@@ -420,10 +441,12 @@ class StableMap:
 
 
 class ImuTrack:
-    """Gyro samples used to guess how far the lidar turned between clouds."""
+    """Facing from the IMU quaternion, with gyro integration as the fallback."""
 
     def __init__(self):
         self.samples = []
+        self.orientation = None
+        self.origin = None
 
     def push(self, stamp, gyro):
         gyro = np.asarray(gyro, dtype=np.float64)
@@ -433,6 +456,24 @@ class ImuTrack:
         cutoff = float(stamp) - 2.0
         while len(self.samples) > 2 and self.samples[0][0] < cutoff:
             self.samples.pop(0)
+
+    def push_orientation(self, quat):
+        """Keep the latest orientation. Cloud and IMU stamps often do not overlap."""
+        rotation = quat_xyzw_to_rot(quat)
+        if rotation is None:
+            return
+        self.orientation = rotation
+
+    def lock_origin(self):
+        """Remember the facing at the first cloud. Later clouds are measured from it."""
+        if self.origin is None and self.orientation is not None:
+            self.origin = np.array(self.orientation, copy=True)
+
+    def facing_in_map(self):
+        """Map-from-lidar rotation since the first cloud, or None if it is not known."""
+        if self.orientation is None or self.origin is None:
+            return None
+        return self.origin.T @ self.orientation
 
     def rotation_since(self, start, end):
         """Rotation of the sensor body from start to end, or None if the gap has no gyro."""
@@ -472,7 +513,7 @@ class Tracker:
         self.translation = np.zeros(3)
         self.last_fit = None
 
-    def add_scan(self, xyz, intensity=None, rotation_hint=None):
+    def add_scan(self, xyz, intensity=None, rotation_hint=None, facing=None):
         xyz = np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
         if intensity is None:
             intensity = np.ones(len(xyz), dtype=np.float64)
@@ -487,10 +528,14 @@ class Tracker:
             self.map.insert(xyz, intensity, normals)
             self.last_fit = 0.0
             return "seed"
-        # rotation_hint is the IMU turn since the last good spin, in the body
-        # frame. It is applied on top of that spin. Substituting an absolute IMU
-        # heading here would throw away the yaw just found and draw the room again.
-        if rotation_hint is None:
+        # facing is where the lidar is pointed in the map, from the IMU
+        # quaternion at the first cloud. It replaces the guess. Stacking it on
+        # the last pose would apply the same turn twice and rotate the room.
+        # rotation_hint is the gyro change since the last good spin, and it is
+        # used only when that quaternion is missing.
+        if facing is not None:
+            guess_rotation = np.array(facing, dtype=np.float64, copy=True)
+        elif rotation_hint is None:
             guess_rotation = np.array(self.rotation, dtype=np.float64, copy=True)
         else:
             guess_rotation = pose_guess(self.rotation, rotation_hint)
@@ -533,6 +578,9 @@ def collect(seconds_between_saves, topic, imu_topic, output, voxel, max_correspo
         imu.push(stamp, [
             msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z
         ])
+        imu.push_orientation([
+            msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w
+        ])
 
     node.create_subscription(PointCloud2, topic, on_cloud, qos_profile_sensor_data)
     node.create_subscription(Imu, imu_topic, on_imu, qos_profile_sensor_data)
@@ -572,18 +620,35 @@ def collect(seconds_between_saves, topic, imu_topic, output, voxel, max_correspo
             delta = None
             if last_stamp is not None:
                 delta = imu.rotation_since(last_stamp, stamp)
-            status = tracker.add_scan(xyz, intensity, rotation_hint=delta)
+            # The map frame is the IMU frame of the cloud that actually seeds it.
+            # If that quaternion arrives one cloud late, adopt it only while the
+            # lidar is still at the start. A later quaternion must not redefine
+            # the room.
+            if (
+                imu.origin is None
+                and len(tracker.map) > 0
+                and counts["aligned"] == 0
+                and np.allclose(tracker.rotation, np.eye(3))
+            ):
+                imu.lock_origin()
+            facing = None if len(tracker.map) == 0 else imu.facing_in_map()
+            status = tracker.add_scan(xyz, intensity, rotation_hint=delta, facing=facing)
+            if status == "seed":
+                imu.lock_origin()
             if status != "skipped":
                 last_stamp = stamp
             counts[status] += 1
             place = tracker.translation
             fit = "  --" if tracker.last_fit is None else f"{tracker.last_fit * 100:4.1f}cm"
             dimu = "  --" if delta is None else f"{heading_deg(delta):5.1f}°"
+            reported = imu.facing_in_map()
+            face = "  --" if reported is None else f"{heading_deg(reported):5.1f}°"
+            imu_on = imu.orientation is not None or len(imu.samples) >= 2
             print(
                 f"{status}: map {len(tracker.map)} points, "
                 f"lidar at {place[0]:.2f} {place[1]:.2f} {place[2]:.2f} m, "
-                f"yaw={heading_deg(tracker.rotation):5.1f}° dIMU={dimu}, "
-                f"wall fit {fit}, imu {'on' if len(imu.samples) >= 2 else 'off'}, "
+                f"yaw={heading_deg(tracker.rotation):5.1f}° face={face} dIMU={dimu}, "
+                f"wall fit {fit}, imu {'on' if imu_on else 'off'}, "
                 f"aligned {counts['aligned']}, skipped {counts['skipped']}",
                 flush=True,
             )
