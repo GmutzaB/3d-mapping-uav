@@ -84,7 +84,23 @@ Wait until it stays up without exiting. Check it from anywhere else with `ros2 t
 python3 ~/3d-mapping-uav/ros2_ws/pi/stable_map.py
 ```
 
-Hold the lidar still for about 2 seconds so the first sweep can fill in and it can learn which way is down. The first line should show thousands of points, not a handful. Then turn, lift, or walk slowly. The map keeps a point about every 2.5 mm. `lidar at x y z` is where the lidar is in the room. `z` should rise when you lift it and stay up; it should not jump back to `0.00 0.00 0.00` while the lidar is still raised. `yaw=` is the map heading. `face=` is the direction the IMU says the lidar is actually facing since the first cloud. `dIMU=` is the gyro turn on that spin, used when `face=` is `--`. One room should stay put. `skipped` means that sweep did not line up, so the pose stays where it was. Pause instead of walking on. Standing still on a finished surface stays `aligned` and does not add a second copy. Ctrl-C writes `~/map.pcd` (it is also rewritten every 5 seconds). Copy it to a computer and open it in CloudCompare:
+Hold the lidar still until the point count is in the tens of thousands and stops climbing. The first line should already be thousands of points, not a handful. A finished surface stays `aligned` and the count holds. The lidar's range wanders by about a centimetre, so a second sweep of the same wall is not stored again. The first sweep, and any surface that is actually new, is still kept about every 2.5 mm.
+
+Then walk, turn, or lift it. This is the same mapper that has to keep working once the lidar is on the drone, so it maps while the sensor is moving, not only while it sits still. `lidar at x y z` is where the lidar is in the room and should keep changing as you move it. `z` rises when you lift it and stays up. `yaw=` is the map heading. `face=` is the direction the IMU says the lidar is facing since the first cloud. `dIMU=` is how far the gyro turned since the last sweep that was kept. One room should stay one room. `skipped` means that sweep was too far from the guess, so the pose stays where it last lined up. Slow down and bring the lidar back toward that spot. Ctrl-C writes `~/map.pcd` (it is also rewritten every 5 seconds). A new run overwrites that file.
+
+After a mapper-only change, leave the lidar window running. In the map window, Ctrl-C, then:
+
+```sh
+cd ~/3d-mapping-uav
+git fetch origin
+git checkout cursor/lidar-facing-yaw-f923
+git pull
+source /opt/ros/lyrical/setup.bash
+source ~/3d-mapping-uav/ros2_ws/install/setup.bash
+python3 ~/3d-mapping-uav/ros2_ws/pi/stable_map.py
+```
+
+On Ubuntu 24.04, source `/opt/ros/jazzy/setup.bash` instead of lyrical. Copy the map to a computer and open it in CloudCompare:
 
 ```sh
 scp mtbf@mtbf:~/map.pcd .

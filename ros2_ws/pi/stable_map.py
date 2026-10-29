@@ -3,16 +3,20 @@
 
 The first cloud is the map. Each later cloud is pulled onto those surfaces
 (so a wall stays one wall) and only points that see new space are added.
+A repeat of the same surface is not stored again: the lidar's range wanders
+by about a centimetre, which is wider than the 2.5 mm spacing of new points.
 The IMU orientation is the direction the lidar is actually facing, measured
 from that first cloud. The gyro turn is used only when the orientation is missing.
-Lifting and walking are tracked too: the accelerometer supplies the move since
-the last cloud, and the floor and walls pull that guess back into place.
+The move since the last kept sweep comes from the IMU's own clock (the cloud
+stamp is a different clock) plus the speed of the last sweep that lined up.
+The floor and walls pull that guess back into place.
 
 Leave the lidar launch running, then:
 
     python3 ros2_ws/pi/stable_map.py
 
-Walk slowly. Ctrl-C stops. ~/map.pcd is rewritten every few seconds.
+Hold still until the count levels off, then move. The same path is what runs
+on the drone. Ctrl-C stops. ~/map.pcd is rewritten every few seconds.
 """
 
 import argparse
@@ -27,6 +31,14 @@ MIN_PAIRS = 40
 MIN_RANGE = 0.4
 # One stored point about every 2.5 mm. Coarser than this was collapsing a room to ~20k points.
 DEFAULT_VOXEL = 0.0025
+# The L2's range on a wall wanders by about a centimetre. A gate tighter than
+# that stores a second sheet of the same surface on every sweep.
+SURFACE_MATCH = 0.02
+# How far one sweep's guess may move. A drone covers this between scans; the
+# walls still have to agree before the pose is kept.
+STEP_LIMIT = 1.0
+IMU_HISTORY = 4.0
+MOTION_GAP = 3.0
 
 
 def write_pcd(path: Path, pts: np.ndarray) -> None:
@@ -97,14 +109,29 @@ def estimate_normals(xyz, radius=0.3):
         return normals
     voxel = radius / 2
     keys = np.floor(xyz / voxel).astype(np.int64)
-    buckets = {}
-    for index, key in enumerate(map(tuple, keys.tolist())):
-        buckets.setdefault(key, []).append(index)
+    order = np.lexsort((keys[:, 2], keys[:, 1], keys[:, 0]))
+    sorted_keys = keys[order]
+    if len(sorted_keys) == 1:
+        bounds = np.array([0, 1])
+    else:
+        changes = np.any(sorted_keys[1:] != sorted_keys[:-1], axis=1)
+        bounds = np.concatenate((
+            [0], np.flatnonzero(changes) + 1, [len(sorted_keys)]
+        ))
+    buckets = {
+        (int(sorted_keys[start, 0]), int(sorted_keys[start, 1]), int(sorted_keys[start, 2])): order[start:end]
+        for start, end in zip(bounds[:-1], bounds[1:])
+    }
     offsets = [(a, b, c) for a in (-1, 0, 1) for b in (-1, 0, 1) for c in (-1, 0, 1)]
     for key, members in buckets.items():
-        neighbors = []
+        neighbor_ids = []
         for offset in offsets:
-            neighbors.extend(buckets.get((key[0] + offset[0], key[1] + offset[1], key[2] + offset[2]), ()))
+            found = buckets.get((key[0] + offset[0], key[1] + offset[1], key[2] + offset[2]))
+            if found is not None:
+                neighbor_ids.append(found)
+        if not neighbor_ids:
+            continue
+        neighbors = np.concatenate(neighbor_ids)
         if len(neighbors) < 6:
             continue
         pts = xyz[neighbors]
@@ -117,6 +144,19 @@ def estimate_normals(xyz, radius=0.3):
             normal = -normal
         normals[members] = normal
     return normals
+
+
+# Cells around a stored point that still count as the same surface.
+# Radius 2 is about 4–6 cm, which covers the lidar's range scatter.
+# The point's own cell is checked first and is not in this list.
+_NEIGHBOR_CELLS = tuple(
+    (a, b, c)
+    for radius in (1, 2)
+    for a in range(-radius, radius + 1)
+    for b in range(-radius, radius + 1)
+    for c in range(-radius, radius + 1)
+    if max(abs(a), abs(b), abs(c)) == radius
+)
 
 
 def _covariance(pts):
@@ -309,17 +349,24 @@ def _shift_search(source, source_normals, target, target_normals, rotation, tran
     # A point or two of noise used to win a 12 cm jump, and the next sweep
     # then scored the origin higher and put the lidar back at 0, 0, 0.
     margin = max(25, int(0.08 * max(best_score, 1)))
-    for meters in (0.12, 0.25, 0.40):
-        for offset in (
+    offsets = []
+    for meters in (0.12, 0.25, 0.40, 0.60, 0.90):
+        offsets.extend((
             (0.0, 0.0, meters), (0.0, 0.0, -meters),
             (meters, 0.0, 0.0), (-meters, 0.0, 0.0),
             (0.0, meters, 0.0), (0.0, -meters, 0.0),
-        ):
-            shift = translation + np.array(offset)
-            found = score(shift)
-            if found >= best_score + margin:
-                best_score = found
-                best_shift = shift
+        ))
+    for meters in (0.45, 0.75):
+        offsets.extend((
+            (meters, meters, 0.0), (meters, -meters, 0.0),
+            (-meters, meters, 0.0), (-meters, -meters, 0.0),
+        ))
+    for offset in offsets:
+        shift = translation + np.array(offset)
+        found = score(shift)
+        if found >= best_score + margin:
+            best_score = found
+            best_shift = shift
     return best_shift
 
 
@@ -340,11 +387,14 @@ def _yaw_search(source, source_normals, target, target_normals, rotation, transl
     best_rotation = rotation
     best_score = _inlier_count(probe_source, probe_target, rotation, translation, gate)
     best_offset = 0
+    # A point or two of noise must not walk the heading off the IMU facing.
+    # A real turn still wins: the tight gate makes the wrong heading miss the walls.
+    margin = max(15, int(0.05 * max(best_score, 1)))
     for degrees in (-90, -60, -40, -25, -12, 12, 25, 40, 60, 90):
         candidate = rotation @ _yaw_matrix(np.deg2rad(degrees))
         score = _inlier_count(probe_source, probe_target, candidate, translation, gate)
         closer = score == best_score and abs(degrees) < abs(best_offset)
-        if score > best_score or closer:
+        if score >= best_score + margin or closer:
             best_score = score
             best_offset = degrees
             best_rotation = candidate
@@ -364,11 +414,19 @@ def _wall_fit(source, source_normals, rotation, translation, target, target_norm
         return None
     walls = apply_pose(rotation, translation, source[keep])
     stored = target[stored_keep]
+    stored_normals = target_normals[stored_keep]
+    # The pose test is a fraction and a median, so a stride stands in for the
+    # whole cloud. Matching every point of a growing map is what made each
+    # sweep take so long that the next one had already moved out of range.
+    chosen = stride_index(len(walls), SOURCE_CAP)
+    walls = walls[chosen]
+    chosen = stride_index(len(stored), TARGET_CAP)
+    stored = stored[chosen]
+    stored_normals = stored_normals[chosen]
     paired = correspondences(walls, stored, gate)
     hits = paired >= 0
     if hits.sum() < MIN_PAIRS or hits.sum() / len(walls) < 0.55:
         return None
-    stored_normals = target_normals[stored_keep]
     residual = np.sum(stored_normals[paired[hits]] * (walls[hits] - stored[paired[hits]]), axis=1)
     fit = float(np.median(np.abs(residual)))
     if fit > 0.03:
@@ -390,12 +448,18 @@ def _floor_fit(source, source_normals, rotation, translation, target, target_nor
         return 0.0
     floors = apply_pose(rotation, translation, source[keep])
     stored = target[stored_keep]
+    stored_normals = target_normals[stored_keep]
+    chosen = stride_index(len(floors), SOURCE_CAP)
+    floors = floors[chosen]
+    chosen = stride_index(len(stored), TARGET_CAP)
+    stored = stored[chosen]
+    stored_normals = stored_normals[chosen]
     paired = correspondences(floors, stored, gate)
     hits = paired >= 0
     if hits.sum() < MIN_PAIRS or hits.sum() / len(floors) < 0.45:
         return None
     residual = np.sum(
-        target_normals[stored_keep][paired[hits]] * (floors[hits] - stored[paired[hits]]),
+        stored_normals[paired[hits]] * (floors[hits] - stored[paired[hits]]),
         axis=1,
     )
     if float(np.median(np.abs(residual))) > 0.03:
@@ -451,13 +515,17 @@ def _rotation_angle(rotation):
 def novelty_gate(voxel):
     """How far a new point must sit from the map before it is stored.
 
-    A fine map uses one cell. The old 5 cm floor was wider than the cell, so
-    later sweeps could not fill anything closer than 5 cm and the cloud stayed sparse.
-    Coarser maps keep a wider margin so a shaky sweep does not paint a second wall.
+    The voxel is still the spacing of points on the first sweep and on any
+    surface that is actually new. On a fine map the gate is one 2 cm cell, and
+    a later point within two cells (about 4–6 cm) is the same surface. That is
+    wider than 2.5 mm because the range scatter is about a centimetre; it is
+    not the old 5 cm floor on the first sweep. A surface about 8 cm farther is
+    still new. Coarser maps keep a wider margin so a shaky sweep does not
+    paint a second wall.
     """
     voxel = float(voxel)
     if voxel <= 0.01:
-        return voxel
+        return max(voxel, SURFACE_MATCH)
     return max(voxel * 2.5, 0.05)
 
 
@@ -487,26 +555,32 @@ class StableMap:
         return np.asarray(self._normals[:self._count], dtype=np.float64)
 
     def novel_mask(self, xyz):
-        """True for points that are not already sitting on a stored surface."""
+        """True for points that are not already sitting on a stored surface.
+
+        A point in the same 2 cm cell as a stored point, or within two cells of
+        it, is the same surface. That covers the lidar's range scatter, which
+        is about a centimetre and was being saved as a second sheet. Checking
+        cells, instead of the distance to every stored point, keeps a full
+        sweep fast enough to follow a moving lidar.
+        """
         xyz = np.asarray(xyz, dtype=np.float64)
-        mask = np.ones(len(xyz), dtype=bool)
-        if self._count == 0 or len(xyz) == 0:
-            return mask
-        limit = self.gate * self.gate
+        count = len(xyz)
+        if self._count == 0 or count == 0:
+            return np.ones(count, dtype=bool)
         keys = np.floor(xyz / self.gate).astype(np.int64)
-        offsets = [(a, b, c) for a in (-1, 0, 1) for b in (-1, 0, 1) for c in (-1, 0, 1)]
-        stored = self._points[:self._count, :3]
-        for index, key in enumerate(keys.tolist()):
-            best = limit + 1
-            for offset in offsets:
-                for stored_index in self._bins.get(
-                    (key[0] + offset[0], key[1] + offset[1], key[2] + offset[2]), ()
-                ):
-                    gap = xyz[index] - stored[stored_index]
-                    dist = float(gap @ gap)
-                    if dist < best:
-                        best = dist
-            mask[index] = best > limit
+        occupied = self._bins
+        mask = np.ones(count, dtype=bool)
+        for index in range(count):
+            x = int(keys[index, 0])
+            y = int(keys[index, 1])
+            z = int(keys[index, 2])
+            if (x, y, z) in occupied:
+                mask[index] = False
+                continue
+            for offset in _NEIGHBOR_CELLS:
+                if (x + offset[0], y + offset[1], z + offset[2]) in occupied:
+                    mask[index] = False
+                    break
         return mask
 
     def insert(self, xyz, intensity, normals=None):
@@ -562,13 +636,17 @@ class ImuTrack:
         self.orientation = None
         self.origin = None
         self.gravity = None
+        # IMU header stamps already consumed. The cloud header is a different
+        # clock, so motion is measured from these cursors, not from the cloud.
+        self._gyro_cursor = None
+        self._accel_cursor = None
 
     def push(self, stamp, gyro):
         gyro = np.asarray(gyro, dtype=np.float64)
         if gyro.shape != (3,) or not np.all(np.isfinite(gyro)):
             return
         self.samples.append((float(stamp), gyro))
-        cutoff = float(stamp) - 2.0
+        cutoff = float(stamp) - IMU_HISTORY
         while len(self.samples) > 2 and self.samples[0][0] < cutoff:
             self.samples.pop(0)
 
@@ -585,7 +663,7 @@ class ImuTrack:
         if accel.shape != (3,) or not np.all(np.isfinite(accel)) or self.orientation is None:
             return
         self.accel.append((float(stamp), accel, np.array(self.orientation, copy=True)))
-        cutoff = float(stamp) - 2.0
+        cutoff = float(stamp) - IMU_HISTORY
         while len(self.accel) > 2 and self.accel[0][0] < cutoff:
             self.accel.pop(0)
 
@@ -604,17 +682,17 @@ class ImuTrack:
     def _map_accel(self, accel, rotation):
         return self.origin.T @ rotation @ np.asarray(accel, dtype=np.float64) - self.gravity
 
-    def shift_since(self, start, end):
+    def shift_since(self, start, end, max_gap=0.5, max_norm=0.75):
         """Map displacement from the accelerometer, or None when gravity or the gap is missing.
 
         Velocity starts at rest at ``start``. Steady speed is carried by the last
         accepted move; this integral is only the extra acceleration in the gap.
+        ``max_gap`` keeps a stale clock from integrating for several seconds and
+        shoving the pose off the map.
         """
         if self.gravity is None or self.origin is None or not self.accel or end < start:
             return None
-        # A skipped sweep used to leave the clock on the old cloud, and the
-        # integral then grew without bound and shoved the pose off the map.
-        if end - start > 0.5:
+        if end - start > max_gap:
             return None
         window = [sample for sample in self.accel if start - 0.05 <= sample[0] <= end + 0.05]
         if len(window) < 2 or window[-1][0] - window[0][0] < 0.5 * (end - start):
@@ -638,9 +716,41 @@ class ImuTrack:
         tail = end - previous_time
         if tail > 0:
             position = position + velocity * tail + 0.5 * accel * tail * tail
-        if not np.all(np.isfinite(position)) or np.linalg.norm(position) > 0.75:
+        if not np.all(np.isfinite(position)) or np.linalg.norm(position) > max_norm:
             return None
         return position
+
+    def advance(self):
+        """Mark the IMU samples so far as already used by a kept sweep."""
+        if self.samples:
+            self._gyro_cursor = self.samples[-1][0]
+        if self.accel:
+            self._accel_cursor = self.accel[-1][0]
+
+    def _preview_span(self, series, cursor):
+        if len(series) < 2:
+            return None
+        end = series[-1][0]
+        start = end if cursor is None else cursor
+        if end <= start:
+            return None
+        if end - start > MOTION_GAP:
+            start = end - MOTION_GAP
+        return start, end
+
+    def preview_shift(self):
+        """Accel move since the last kept sweep, on the IMU clock."""
+        span = self._preview_span(self.accel, self._accel_cursor)
+        if span is None:
+            return None
+        return self.shift_since(span[0], span[1], max_gap=MOTION_GAP, max_norm=STEP_LIMIT)
+
+    def preview_rotation(self):
+        """Gyro turn since the last kept sweep, on the IMU clock."""
+        span = self._preview_span(self.samples, self._gyro_cursor)
+        if span is None:
+            return None
+        return self.rotation_since(span[0], span[1])
 
     def facing_in_map(self):
         """Map-from-lidar rotation since the first cloud, or None if it is not known."""
@@ -685,9 +795,17 @@ class Tracker:
         self.rotation = np.eye(3)
         self.translation = np.zeros(3)
         self.step = np.zeros(3)
+        self.speed = np.zeros(3)
         self.last_fit = None
 
-    def add_scan(self, xyz, intensity=None, rotation_hint=None, facing=None, translation_hint=None):
+    def note_elapsed(self, seconds):
+        """Turn the last accepted move into a speed. The next guess carries it."""
+        seconds = float(seconds)
+        if seconds <= 0.05:
+            return
+        self.speed = self.step / seconds
+
+    def add_scan(self, xyz, intensity=None, rotation_hint=None, facing=None, translation_hint=None, carried=None):
         xyz = np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
         if intensity is None:
             intensity = np.ones(len(xyz), dtype=np.float64)
@@ -727,12 +845,19 @@ class Tracker:
         for use_motion in (True, False):
             guess_translation = np.array(previous_translation, copy=True)
             if use_motion:
-                guess_translation = guess_translation + self.step
+                # carried is the speed of the last kept sweep times the time
+                # since then. Tests that do not time the sweeps use the last
+                # displacement instead.
+                motion = self.step if carried is None else np.asarray(carried, dtype=np.float64)
+                motion_length = float(np.linalg.norm(motion))
+                if motion_length > STEP_LIMIT:
+                    motion = motion * (STEP_LIMIT / motion_length)
+                guess_translation = guess_translation + motion
                 if translation_hint is not None:
                     hint = np.asarray(translation_hint, dtype=np.float64)
                     length = float(np.linalg.norm(hint))
-                    if length > 0.25:
-                        hint = hint * (0.25 / length)
+                    if length > STEP_LIMIT:
+                        hint = hint * (STEP_LIMIT / length)
                     guess_translation = guess_translation + hint
             rotation, translation, ok, fit = align_scan(
                 xyz, normals, self.map.xyz(), self.map.normals(),
@@ -742,7 +867,8 @@ class Tracker:
                 break
         self.last_fit = fit
         if not ok:
-            self.step = np.zeros(3)
+            # Keep the last speed. Zeroing it left the next guess at the start
+            # after a single miss, and every later sweep then missed too.
             return "skipped"
         moved = apply_pose(rotation, translation, xyz)
         moved_normals = (rotation @ normals.T).T
@@ -751,8 +877,8 @@ class Tracker:
         length = float(np.linalg.norm(delta))
         if length < 0.01:
             self.step = np.zeros(3)
-        elif length > 0.3:
-            self.step = delta * (0.3 / length)
+        elif length > STEP_LIMIT:
+            self.step = delta * (STEP_LIMIT / length)
         else:
             self.step = delta
         self.rotation = rotation
@@ -763,7 +889,7 @@ class Tracker:
 
 def collect(seconds_between_saves, topic, imu_topic, output, voxel, max_correspondence):
     import rclpy
-    from rclpy.qos import qos_profile_sensor_data
+    from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
     from sensor_msgs.msg import Imu, PointCloud2
     from sensor_msgs_py import point_cloud2
 
@@ -773,8 +899,15 @@ def collect(seconds_between_saves, topic, imu_topic, output, voxel, max_correspo
     imu = ImuTrack()
     pending = {}
     last_save = time.monotonic()
-    last_stamp = None
+    last_kept = None
     counts = {"seed": 0, "aligned": 0, "skipped": 0}
+    # The sensor profile keeps five messages. A sweep used to take long enough
+    # that the gyro and accel samples in between were thrown away.
+    imu_qos = QoSProfile(
+        reliability=ReliabilityPolicy.BEST_EFFORT,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=400,
+    )
 
     def on_cloud(msg: PointCloud2) -> None:
         pending["msg"] = msg
@@ -794,9 +927,10 @@ def collect(seconds_between_saves, topic, imu_topic, output, voxel, max_correspo
         ])
 
     node.create_subscription(PointCloud2, topic, on_cloud, qos_profile_sensor_data)
-    node.create_subscription(Imu, imu_topic, on_imu, qos_profile_sensor_data)
+    node.create_subscription(Imu, imu_topic, on_imu, imu_qos)
     print(
-        f"mapping {topic} into {output} with about {voxel * 1000:.1f} mm between points — walk slowly",
+        f"mapping {topic} into {output} with about {voxel * 1000:.1f} mm between points"
+        " — hold still until the count levels off, then move",
         flush=True,
     )
 
@@ -827,12 +961,17 @@ def collect(seconds_between_saves, topic, imu_topic, output, voxel, max_correspo
                     msg, field_names=["x", "y", "z"], skip_nans=True
                 )
                 intensity = np.ones(len(xyz))
-            stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-            delta = None
-            shift = None
-            if last_stamp is not None:
-                delta = imu.rotation_since(last_stamp, stamp)
-                shift = imu.shift_since(last_stamp, stamp)
+            # The cloud header and the IMU header do not share a clock, so a
+            # window between those stamps is empty and the guess stays put.
+            # Integrate the IMU samples on their own stamps instead.
+            now = time.monotonic()
+            delta = imu.preview_rotation()
+            shift = imu.preview_shift()
+            carried = None
+            if last_kept is not None:
+                elapsed = now - last_kept
+                if 0.02 < elapsed <= MOTION_GAP:
+                    carried = tracker.speed * elapsed
             # The map frame is the IMU frame of the cloud that actually seeds it.
             # If that quaternion arrives one cloud late, adopt it only while the
             # lidar is still at the start. A later quaternion must not redefine
@@ -846,14 +985,21 @@ def collect(seconds_between_saves, topic, imu_topic, output, voxel, max_correspo
                 imu.lock_origin()
             facing = None if len(tracker.map) == 0 else imu.facing_in_map()
             status = tracker.add_scan(
-                xyz, intensity, rotation_hint=delta, facing=facing, translation_hint=shift,
+                xyz, intensity,
+                rotation_hint=delta,
+                facing=facing,
+                translation_hint=shift,
+                carried=carried,
             )
             if status == "seed":
                 imu.lock_origin()
             if imu.gravity is None and np.linalg.norm(tracker.translation) < 0.02:
                 imu.lock_gravity()
             if status != "skipped":
-                last_stamp = stamp
+                if last_kept is not None:
+                    tracker.note_elapsed(now - last_kept)
+                imu.advance()
+                last_kept = time.monotonic()
             counts[status] += 1
             place = tracker.translation
             fit = "  --" if tracker.last_fit is None else f"{tracker.last_fit * 100:4.1f}cm"

@@ -87,8 +87,10 @@ class StableMapTests(unittest.TestCase):
         tracker = Tracker()
         self.assertAlmostEqual(tracker.voxel, 0.0025)
         self.assertAlmostEqual(tracker.voxel, DEFAULT_VOXEL)
-        self.assertAlmostEqual(novelty_gate(0.0025), 0.0025)
-        self.assertLess(tracker.map.gate, 0.004)
+        # New points stay 2.5 mm apart. A repeat of the same surface has to
+        # clear the centimetre of range noise before it is stored again.
+        self.assertAlmostEqual(novelty_gate(0.0025), 0.02)
+        self.assertAlmostEqual(tracker.map.gate, 0.02)
         self.assertGreater(novelty_gate(0.05), 0.05)
 
     def test_points_a_few_millimetres_apart_are_both_kept(self):
@@ -96,7 +98,9 @@ class StableMapTests(unittest.TestCase):
         added = grid.insert([[0.0, 0.0, 0.0], [0.003, 0.0, 0.0]], [1.0, 1.0])
         self.assertEqual(added, 2)
         self.assertEqual(grid.insert([[0.001, 0.0, 0.0]], [1.0]), 0)
-        mask = grid.novel_mask([[0.003, 0.003, 0.0], [0.001, 0.0, 0.0]])
+        # 5 mm shares the stored cell, so it is the same surface.
+        # 8 cm is past the cells that count as range scatter, so it is new space.
+        mask = grid.novel_mask([[0.08, 0.0, 0.0], [0.005, 0.0, 0.0]])
         self.assertTrue(bool(mask[0]))
         self.assertFalse(bool(mask[1]))
 
@@ -474,6 +478,87 @@ class StableMapTests(unittest.TestCase):
             "aligned",
         )
         self.assertAlmostEqual(heading_deg(tracker.rotation), 15, delta=8)
+
+    def test_sensor_noise_does_not_lay_a_second_sheet(self):
+        rng = np.random.default_rng(9)
+        ys = np.linspace(-0.5, 0.5, 70)
+        zs = np.linspace(0.2, 1.0, 36)
+        yy, zz = np.meshgrid(ys, zs)
+        base = np.column_stack((np.full(yy.size, 2.0), yy.ravel(), zz.ravel()))
+        tracker = Tracker()
+        self.assertEqual(tracker.add_scan(base), "seed")
+        before = len(tracker.map)
+        self.assertGreater(before, 1000)
+        noisy = base + rng.normal(0.0, 0.01, base.shape)
+        self.assertEqual(tracker.add_scan(noisy), "aligned")
+        self.assertLess(len(tracker.map), before + before // 5)
+        opened = base + np.array([0.08, 0.0, 0.0])
+        self.assertGreater(float(tracker.map.novel_mask(opened).mean()), 0.9)
+
+    def test_a_walk_without_an_imu_shift_keeps_aligning(self):
+        # No translation hint: the cloud clock did not match the IMU, which is
+        # what the Pi does. The sweep still has to be found and then carried.
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        tracker.add_scan(original)
+        seed_count = len(tracker.map)
+        translation = np.zeros(3)
+        for step in (
+            np.array([0.55, 0.00, 0.00]),
+            np.array([0.50, 0.35, 0.15]),
+            np.array([0.40, -0.25, 0.20]),
+        ):
+            translation = translation + step
+            scan = self._moved(original, np.eye(3), translation)
+            self.assertEqual(tracker.add_scan(scan, facing=np.eye(3)), "aligned")
+            np.testing.assert_allclose(tracker.translation, translation, atol=0.08)
+        self.assertLess(len(tracker.map), int(seed_count * 1.35) + 5)
+
+    def test_kept_speed_reaches_a_sweep_past_the_match_gate(self):
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.2)
+        tracker.add_scan(original)
+        first = np.array([0.15, 0.0, 0.0])
+        self.assertEqual(
+            tracker.add_scan(self._moved(original, np.eye(3), first), facing=np.eye(3)),
+            "aligned",
+        )
+        tracker.note_elapsed(0.5)
+        second = np.array([1.45, 0.0, 0.0])
+        missed = Tracker(voxel=0.05, max_correspondence=0.2)
+        missed.add_scan(original)
+        missed.add_scan(self._moved(original, np.eye(3), first), facing=np.eye(3))
+        self.assertEqual(
+            missed.add_scan(self._moved(original, np.eye(3), second), facing=np.eye(3)),
+            "skipped",
+        )
+        carried = tracker.speed * 4.0
+        self.assertEqual(
+            tracker.add_scan(
+                self._moved(original, np.eye(3), second),
+                facing=np.eye(3),
+                carried=carried,
+            ),
+            "aligned",
+        )
+        np.testing.assert_allclose(tracker.translation, second, atol=0.08)
+
+    def test_imu_motion_uses_the_imu_clock_not_the_cloud_stamp(self):
+        imu = ImuTrack()
+        imu.push_orientation((0.0, 0.0, 0.0, 1.0))
+        for step in range(8):
+            imu.push_accel(step * 0.05, (0.0, 0.0, 9.81))
+        imu.lock_origin()
+        imu.lock_gravity()
+        imu.advance()
+        for step in range(11):
+            imu.push_accel(0.40 + step * 0.05, (0.0, 0.0, 11.81))
+        shift = imu.preview_shift()
+        self.assertIsNotNone(shift)
+        self.assertGreater(shift[2], 0.15)
+        self.assertLess(abs(shift[0]) + abs(shift[1]), 0.05)
+        # A cloud stamp in another epoch used to be the window, and it missed.
+        self.assertIsNone(imu.shift_since(100.0, 100.5))
 
 
 if __name__ == "__main__":
