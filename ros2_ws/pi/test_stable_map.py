@@ -99,10 +99,12 @@ class StableMapTests(unittest.TestCase):
         self.assertEqual(added, 2)
         self.assertEqual(grid.insert([[0.001, 0.0, 0.0]], [1.0]), 0)
         # 5 mm shares the stored cell, so it is the same surface.
-        # 8 cm is past the cells that count as range scatter, so it is new space.
-        mask = grid.novel_mask([[0.08, 0.0, 0.0], [0.005, 0.0, 0.0]])
+        # 6 cm of pose wobble along the wall is still that surface.
+        # 16 cm is past the cells that count as pose wobble and range scatter.
+        mask = grid.novel_mask([[0.16, 0.0, 0.0], [0.0, 0.06, 0.0], [0.005, 0.0, 0.0]])
         self.assertTrue(bool(mask[0]))
         self.assertFalse(bool(mask[1]))
+        self.assertFalse(bool(mask[2]))
 
     def test_first_point_in_a_voxel_is_kept(self):
         grid = StableMap(0.1)
@@ -161,6 +163,22 @@ class StableMapTests(unittest.TestCase):
         # moving 4 cm toward the wall. Motion along the wall stays small.
         np.testing.assert_allclose(tracker.translation[0], -0.04, atol=0.03)
         self.assertLess(abs(tracker.translation[1]), 0.08)
+
+    def test_wobble_along_a_wall_is_not_stored_again(self):
+        # The pose can slide a few centimetres along a wall while the range
+        # error stays about a centimetre. That used to paint a second sheet
+        # and the count climbed on every still sweep.
+        ys = np.linspace(-0.4, 0.4, 50)
+        zs = np.linspace(0.2, 1.0, 24)
+        yy, zz = np.meshgrid(ys, zs)
+        base = np.column_stack((np.full(yy.size, 2.0), yy.ravel(), zz.ravel()))
+        tracker = Tracker()
+        self.assertEqual(tracker.add_scan(base), "seed")
+        before = len(tracker.map)
+        slid = base + np.array([0.012, 0.06, 0.0])
+        self.assertLess(float(tracker.map.novel_mask(slid).mean()), 0.08)
+        self.assertEqual(tracker.add_scan(slid), "aligned")
+        self.assertLess(len(tracker.map), before + max(30, before // 10))
 
     def test_repeating_the_same_wall_does_not_thicken_it(self):
         rng = np.random.default_rng(2)
@@ -358,6 +376,60 @@ class StableMapTests(unittest.TestCase):
         )
         np.testing.assert_allclose(tracker.translation, second, atol=0.05)
 
+    def test_a_move_that_sees_new_space_still_locks_on(self):
+        # Half the sweep is a wall the map has never seen. Requiring most of
+        # the cloud to land on the old room used to skip this, and holding
+        # still there skipped forever.
+        rng = np.random.default_rng(12)
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        tracker.add_scan(original)
+        translation = np.array([0.70, -0.35, 0.12])
+        scan = self._moved(original, np.eye(3), translation)
+        extra = np.column_stack((
+            np.full(500, 6.0),
+            rng.uniform(-1.2, 1.2, 500),
+            rng.uniform(0.2, 1.4, 500),
+        ))
+        extra = self._moved(extra, np.eye(3), translation)
+        cloud = np.vstack((scan, extra))
+        seed_count = len(tracker.map)
+        self.assertEqual(tracker.add_scan(cloud, facing=np.eye(3)), "aligned")
+        np.testing.assert_allclose(tracker.translation, translation, atol=0.08)
+        # The new wall is stored on the sweep that first sees it.
+        self.assertGreater(len(tracker.map), seed_count + 50)
+        before = len(tracker.map)
+        self.assertEqual(tracker.add_scan(cloud, facing=np.eye(3)), "aligned")
+        np.testing.assert_allclose(tracker.translation, translation, atol=0.08)
+        # Holding still there keeps aligning, and does not lay that wall again.
+        self.assertLess(len(tracker.map), before + 30)
+
+    def test_a_sideways_guess_does_not_slide_the_room(self):
+        # Walls parallel to the guess still touch the map. That used to look
+        # like a match and the room was stored a second time, shifted over.
+        original = _room_with_floor()
+        tracker = Tracker(voxel=0.05, max_correspondence=0.45)
+        tracker.add_scan(original)
+        self.assertEqual(
+            tracker.add_scan(
+                original,
+                facing=np.eye(3),
+                translation_hint=np.array([0.8, 0.0, 0.0]),
+            ),
+            "aligned",
+        )
+        np.testing.assert_allclose(tracker.translation, np.zeros(3), atol=0.08)
+
+    def test_a_gyro_gap_is_not_a_phantom_spin(self):
+        imu = ImuTrack()
+        rate = np.array([0.0, 0.0, np.deg2rad(90)])
+        imu.push(0.0, rate)
+        imu.push(0.01, rate)
+        imu.push(2.0, rate)
+        turned = imu.rotation_since(0.0, 2.0)
+        self.assertIsNotNone(turned)
+        self.assertLess(abs(heading_deg(turned)), 15.0)
+
     def test_holding_still_after_a_move_locks_on(self):
         # The guess stays at the start, and this pose is not on the old axis
         # samples. The same cloud is then repeated. Those repeats have to align
@@ -521,7 +593,7 @@ class StableMapTests(unittest.TestCase):
         noisy = base + rng.normal(0.0, 0.01, base.shape)
         self.assertEqual(tracker.add_scan(noisy), "aligned")
         self.assertLess(len(tracker.map), before + before // 5)
-        opened = base + np.array([0.08, 0.0, 0.0])
+        opened = base + np.array([0.16, 0.0, 0.0])
         self.assertGreater(float(tracker.map.novel_mask(opened).mean()), 0.9)
 
     def test_a_walk_without_an_imu_shift_keeps_aligning(self):

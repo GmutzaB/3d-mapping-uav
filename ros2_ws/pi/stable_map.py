@@ -42,6 +42,9 @@ STEP_LIMIT = 1.0
 # After the guess misses, look this far around it. Holding the lidar still at
 # the new spot has to be found again, or every later sweep stays skipped.
 REACQUIRE_RADIUS = 2.0
+# A point this close to a wall, but outside the tight gate, is the same wall
+# with the wrong pose. Farther than this is a different surface.
+NEAR_MISS = 0.35
 IMU_HISTORY = 4.0
 MOTION_GAP = 3.0
 
@@ -152,16 +155,21 @@ def estimate_normals(xyz, radius=0.3):
 
 
 # Cells around a stored point that still count as the same surface.
-# Radius 2 is about 4–6 cm, which covers the lidar's range scatter.
-# The point's own cell is checked first and is not in this list.
+# The pose wanders by a few centimetres while the lidar sits still, and the
+# range wanders by about a centimetre. Radius 4 on a 2 cm cell covers that,
+# so a still sweep does not paint another sheet. The point's own cell is
+# checked first and is not in this list.
 _NEIGHBOR_CELLS = tuple(
     (a, b, c)
-    for radius in (1, 2)
+    for radius in range(1, 5)
     for a in range(-radius, radius + 1)
     for b in range(-radius, radius + 1)
     for c in range(-radius, radius + 1)
     if max(abs(a), abs(b), abs(c)) == radius
 )
+# A gap longer than this between IMU samples is a dropped stretch. Holding the
+# last rate across it turns a pause into a phantom spin (tens of degrees).
+_MAX_IMU_STEP = 0.15
 
 
 def _covariance(pts):
@@ -242,9 +250,9 @@ def align_scan(source, source_normals, target, target_normals, rotation, transla
     chosen = stride_index(len(target), TARGET_CAP)
     target = target[chosen]
     target_normals = target_normals[chosen]
-    chosen = stride_index(len(source), SOURCE_CAP)
-    source = source[chosen]
-    source_normals = source_normals[chosen]
+    # The source is not thinned here. A uniform stride drops the old walls
+    # once most of the sweep is new space, and the pose test then sees no
+    # overlap. The plane steps thin their own copy.
     found = _refine(
         source, source_normals, target, target_normals,
         rotation, translation, max_distance, iterations,
@@ -254,47 +262,77 @@ def align_scan(source, source_normals, target, target_normals, rotation, transla
     for shift in _reacquire_translations(
         source, source_normals, target, target_normals, rotation, translation
     ):
+        # Far from the guess, a tight yaw gate cannot see the turn. Search yaw
+        # more loosely here; the wall test below is still the tight one.
+        yaw_gate = 0.35 if np.linalg.norm(shift - translation) > 0.3 else None
         found = _refine(
             source, source_normals, target, target_normals,
-            rotation, shift, max_distance, iterations,
+            rotation, shift, max_distance, iterations, yaw_gate=yaw_gate,
         )
         if found[2]:
             return found
     return rotation, translation, False, None
 
 
-def _refine(source, source_normals, target, target_normals, rotation, translation, max_distance, iterations):
-    """Yaw search, plane steps, then the wall and floor test. No position jump."""
+def _pose_fit(source, source_normals, rotation, translation, target, target_normals, gate):
+    """Wall error when this pose sits on the walls and the floor. None when it does not."""
+    fit = _wall_fit(
+        source, source_normals, rotation, translation, target, target_normals, gate
+    )
+    if fit is None or _floor_fit(
+        source, source_normals, rotation, translation, target, target_normals, gate
+    ) is None:
+        return None
+    return fit
+
+
+def _refine(source, source_normals, target, target_normals, rotation, translation, max_distance, iterations, yaw_gate=None):
+    """Yaw search, plane steps, then the wall and floor test. No position jump.
+
+    The pose that enters the plane steps is kept when those steps walk off a
+    match. A sweep that already sits on the walls used to be thrown away, and
+    every later sweep then skipped from the last place that had worked.
+    """
     current_rotation, current_translation, yaw_ok = _yaw_search(
-        source, source_normals, target, target_normals, rotation, translation, max_distance
+        source, source_normals, target, target_normals, rotation, translation, max_distance,
+        yaw_gate=yaw_gate,
     )
     if not yaw_ok:
         return rotation, translation, False, None
     tight = max(0.08, min(0.12, max_distance * 0.35))
+    held_fit = _pose_fit(
+        source, source_normals, current_rotation, current_translation, target, target_normals, tight
+    )
+    held = (
+        None if held_fit is None
+        else (np.array(current_rotation, copy=True), np.array(current_translation, copy=True), held_fit)
+    )
+    icp_index = stride_index(len(source), SOURCE_CAP)
+    icp_source = source[icp_index]
     for step in range(iterations):
         limit = max_distance if step < iterations // 2 else tight
-        moved = apply_pose(current_rotation, current_translation, source)
+        moved = apply_pose(current_rotation, current_translation, icp_source)
         paired = correspondences(moved, target, limit)
         use = _with_normals(paired, target_normals)
         if use.sum() < MIN_PAIRS:
-            return rotation, translation, False, None
+            break
         delta_rotation, delta_translation, step_ok = _plane_step(
             moved[use], target[paired[use]], target_normals[paired[use]]
         )
         if not step_ok:
-            return rotation, translation, False, None
+            break
         current_rotation = delta_rotation @ current_rotation
         current_translation = delta_rotation @ current_translation + delta_translation
         if np.linalg.norm(delta_translation) < 1e-3 and _rotation_angle(delta_rotation) < 1e-3:
             break
-    fit = _wall_fit(
+    fit = _pose_fit(
         source, source_normals, current_rotation, current_translation, target, target_normals, tight
     )
-    if fit is None or _floor_fit(
-        source, source_normals, current_rotation, current_translation, target, target_normals, tight
-    ) is None:
-        return rotation, translation, False, None
-    return current_rotation, current_translation, True, fit
+    if fit is not None:
+        return current_rotation, current_translation, True, fit
+    if held is not None:
+        return held[0], held[1], True, held[2]
+    return rotation, translation, False, None
 
 
 def _with_normals(paired, normals):
@@ -338,6 +376,35 @@ def _floor_points(points, normals, min_range, rotation=None):
     return points[keep]
 
 
+def _direction_pairs(source, source_normals, target, target_normals, rotation):
+    """One sample of each wall direction, in the lidar frame and on the map.
+
+    A new wall can be most of the sweep. Counting every upright point then
+    follows that new wall onto whatever it happens to touch, and the old
+    walls never get a vote. Each direction is sampled on its own, and the
+    search keeps the pose where the weaker direction still lands.
+    """
+    keep = _upright_mask(source, source_normals, MIN_RANGE)
+    stored_keep = _upright_mask(target, target_normals, 0.0)
+    if keep.sum() < MIN_PAIRS or stored_keep.sum() < MIN_PAIRS:
+        return []
+    posed = (np.asarray(rotation, dtype=np.float64) @ np.asarray(source_normals, dtype=np.float64).T).T
+    source_bins = _normal_bins(posed[keep])
+    stored_bins = _normal_bins(target_normals[stored_keep])
+    source_points = source[keep]
+    stored_points = target[stored_keep]
+    pairs = []
+    for direction in (0, 1):
+        src_idx = np.flatnonzero(source_bins == direction)
+        dst_idx = np.flatnonzero(stored_bins == direction)
+        if len(src_idx) < 15 or len(dst_idx) < 15:
+            continue
+        src_idx = src_idx[stride_index(len(src_idx), 80)]
+        dst_idx = dst_idx[stride_index(len(dst_idx), 200)]
+        pairs.append((source_points[src_idx], stored_points[dst_idx]))
+    return pairs
+
+
 def _reacquire_translations(source, source_normals, target, target_normals, rotation, translation):
     """Positions around the guess worth a full alignment.
 
@@ -346,12 +413,15 @@ def _reacquire_translations(source, source_normals, target, target_normals, rota
     matched, and holding the lidar still there skipped forever. Walls pick the
     horizontal cell. The floor, when this sweep has one, picks the height.
     """
+    directions = _direction_pairs(source, source_normals, target, target_normals, rotation)
     probe_wall = _wall_points(source, source_normals, MIN_RANGE)
     stored_wall = _wall_points(target, target_normals, 0.0)
-    if probe_wall is None or stored_wall is None:
+    if not directions and (probe_wall is None or stored_wall is None):
         return []
-    probe_wall = probe_wall[stride_index(len(probe_wall), 120)]
-    stored_wall = stored_wall[stride_index(len(stored_wall), 400)]
+    if probe_wall is not None:
+        probe_wall = probe_wall[stride_index(len(probe_wall), 120)]
+    if stored_wall is not None:
+        stored_wall = stored_wall[stride_index(len(stored_wall), 400)]
     probe_floor = _floor_points(source, source_normals, MIN_RANGE, rotation)
     stored_floor = _floor_points(target, target_normals, 0.0)
     if probe_floor is not None:
@@ -361,7 +431,14 @@ def _reacquire_translations(source, source_normals, target, target_normals, rota
     center = np.asarray(translation, dtype=np.float64)
 
     def wall_score(shift, gate):
-        return _inlier_count(probe_wall, stored_wall, rotation, shift, gate)
+        if not directions:
+            return _inlier_count(probe_wall, stored_wall, rotation, shift, gate)
+        # The weaker direction decides. A new wall is one direction and can
+        # touch the map by accident; the other direction still has to land.
+        return min(
+            _inlier_count(probe, stored, rotation, shift, gate)
+            for probe, stored in directions
+        )
 
     def floor_score(shift, gate):
         if probe_floor is None or stored_floor is None:
@@ -413,14 +490,14 @@ def _reacquire_translations(source, source_normals, target, target_normals, rota
     return picks
 
 
-def _yaw_search(source, source_normals, target, target_normals, rotation, translation, max_distance):
+def _yaw_search(source, source_normals, target, target_normals, rotation, translation, max_distance, yaw_gate=None):
     """Pick the body yaw, around the prior, that lands the walls on the walls.
 
     The gate is tight on purpose. A wide gate counts a point that merely reaches
     some wall, so a square room scores just as well a quarter-turn off, and the
     sweep is stored as another rotated copy.
     """
-    gate = max(0.08, min(0.12, max_distance * 0.35))
+    gate = max(0.08, min(0.12, max_distance * 0.35)) if yaw_gate is None else float(yaw_gate)
     probe_source = _wall_points(source, source_normals, MIN_RANGE)
     probe_target = _wall_points(target, target_normals, 0.0)
     if probe_source is None or probe_target is None:
@@ -444,18 +521,34 @@ def _yaw_search(source, source_normals, target, target_normals, rotation, transl
     return best_rotation, translation, True
 
 
-def _wall_fit(source, source_normals, rotation, translation, target, target_normals, gate):
-    """Share of upright points that land on an upright surface, and their plane error.
+def _normal_bins(normals):
+    """Two wall directions: facing across x, or facing across y.
 
-    Returns None when the walls miss. A high score from the floor alone is a miss.
-    Source points are still in the lidar frame, so the near-field blob around the
-    sensor is dropped before the pose is applied.
+    Opposite normals are the same direction. A cut at 45 degree steps flips
+    when a plane step turns the cloud by a fraction of a degree, and the old
+    walls then look like a direction the map does not have.
+    """
+    return (np.abs(normals[:, 1]) > np.abs(normals[:, 0])).astype(np.int64)
+
+
+def _wall_fit(source, source_normals, rotation, translation, target, target_normals, gate):
+    """Plane error when the walls agree. None when they do not.
+
+    A high score from the floor alone is a miss. Source points are still in the
+    lidar frame, so the near-field blob around the sensor is dropped before the
+    pose is applied.
+
+    Most of a still sweep lands on the stored walls. After a move, most of the
+    sweep can be new space. That new space must not veto a pose: each wall
+    direction that still overlaps the map has to sit on that wall, and points
+    farther out are the new view.
     """
     keep = _upright_mask(source, source_normals, MIN_RANGE)
     stored_keep = _upright_mask(target, target_normals, 0.0)
     if keep.sum() < MIN_PAIRS or stored_keep.sum() < MIN_PAIRS:
         return None
     walls = apply_pose(rotation, translation, source[keep])
+    wall_normals = (np.asarray(rotation, dtype=np.float64) @ source_normals[keep].T).T
     stored = target[stored_keep]
     stored_normals = target_normals[stored_keep]
     # The pose test is a fraction and a median, so a stride stands in for the
@@ -463,18 +556,53 @@ def _wall_fit(source, source_normals, rotation, translation, target, target_norm
     # sweep take so long that the next one had already moved out of range.
     chosen = stride_index(len(walls), SOURCE_CAP)
     walls = walls[chosen]
+    wall_normals = wall_normals[chosen]
     chosen = stride_index(len(stored), TARGET_CAP)
     stored = stored[chosen]
     stored_normals = stored_normals[chosen]
     paired = correspondences(walls, stored, gate)
     hits = paired >= 0
-    if hits.sum() < MIN_PAIRS or hits.sum() / len(walls) < 0.55:
+    if hits.sum() < MIN_PAIRS:
         return None
     residual = np.sum(stored_normals[paired[hits]] * (walls[hits] - stored[paired[hits]]), axis=1)
     fit = float(np.median(np.abs(residual)))
     if fit > 0.03:
         return None
-    return fit
+    # A high overall score is not enough. Walls parallel to a slide still
+    # touch the map, so each wall direction has to agree on its own.
+    return fit if _overlap_agrees(walls, wall_normals, stored, stored_normals, hits) else None
+
+
+def _overlap_agrees(walls, wall_normals, stored, stored_normals, hits):
+    """True when every overlapping wall direction sits on the map.
+
+    Points farther than a near miss are new space and do not vote. A slide
+    along the room leaves one wall direction with nothing on the map, and
+    that direction rejects the pose.
+    """
+    wall_bins = _normal_bins(wall_normals)
+    stored_bins = _normal_bins(stored_normals)
+    near_paired = correspondences(walls, stored, NEAR_MISS)
+    near = near_paired >= 0
+    same = np.zeros(len(walls), dtype=bool)
+    if np.any(near):
+        same[near] = stored_bins[near_paired[near]] == wall_bins[near]
+    # A direction can be a small share of the sweep once most of the cloud is
+    # new space. Twenty points on that wall is enough to see that it agrees,
+    # and a near miss next to them still rejects a slid pose.
+    overlap_min = 20
+    checked = 0
+    for direction in range(2):
+        source_here = wall_bins == direction
+        if source_here.sum() < overlap_min or (stored_bins == direction).sum() < overlap_min:
+            continue
+        checked += 1
+        tight = int((hits & source_here).sum())
+        contradictions = int((~hits & source_here & same).sum())
+        overlapping = tight + contradictions
+        if overlapping < overlap_min or tight / overlapping < 0.55:
+            return False
+    return checked > 0
 
 
 def _floor_fit(source, source_normals, rotation, translation, target, target_normals, gate):
@@ -499,15 +627,23 @@ def _floor_fit(source, source_normals, rotation, translation, target, target_nor
     stored_normals = stored_normals[chosen]
     paired = correspondences(floors, stored, gate)
     hits = paired >= 0
-    if hits.sum() < MIN_PAIRS or hits.sum() / len(floors) < 0.45:
+    if hits.sum() < MIN_PAIRS:
         return None
+    fraction = hits.sum() / len(floors)
     residual = np.sum(
         stored_normals[paired[hits]] * (floors[hits] - stored[paired[hits]]),
         axis=1,
     )
-    if float(np.median(np.abs(residual))) > 0.03:
+    fit = float(np.median(np.abs(residual)))
+    if fit > 0.03:
         return None
-    return float(np.median(np.abs(residual)))
+    if fraction >= 0.45:
+        return fit
+    # Part of the floor can leave the view when the lidar moves. The part that
+    # still hits has to sit tight, or a lifted pose would pass on the walls.
+    if fraction >= 0.25 and fit <= 0.02:
+        return fit
+    return None
 
 
 def _yaw_matrix(radians):
@@ -559,10 +695,10 @@ def novelty_gate(voxel):
     """How far a new point must sit from the map before it is stored.
 
     The voxel is still the spacing of points on the first sweep and on any
-    surface that is actually new. On a fine map the gate is one 2 cm cell, and
-    a later point within two cells (about 4–6 cm) is the same surface. That is
-    wider than 2.5 mm because the range scatter is about a centimetre; it is
-    not the old 5 cm floor on the first sweep. A surface about 8 cm farther is
+    surface that is actually new. On a fine map a later point within about
+    8 cm is the same surface: the pose wanders by a few centimetres while the
+    lidar sits still, and the range wanders by about a centimetre. It is not
+    the old 5 cm floor on the first sweep. A surface about 15 cm farther is
     still new. Coarser maps keep a wider margin so a shaky sweep does not
     paint a second wall.
     """
@@ -600,11 +736,11 @@ class StableMap:
     def novel_mask(self, xyz):
         """True for points that are not already sitting on a stored surface.
 
-        A point in the same 2 cm cell as a stored point, or within two cells of
-        it, is the same surface. That covers the lidar's range scatter, which
-        is about a centimetre and was being saved as a second sheet. Checking
-        cells, instead of the distance to every stored point, keeps a full
-        sweep fast enough to follow a moving lidar.
+        A point in the same 2 cm cell as a stored point, or within four cells
+        of it, is the same surface. That covers the pose wobble of a few
+        centimetres plus the lidar's range scatter. Checking cells, instead of
+        the distance to every stored point, keeps a full sweep fast enough to
+        follow a moving lidar.
         """
         xyz = np.asarray(xyz, dtype=np.float64)
         count = len(xyz)
@@ -751,13 +887,13 @@ class ImuTrack:
             if stamp > end:
                 break
             step = stamp - previous_time
-            if step > 0:
+            if 0 < step <= _MAX_IMU_STEP:
                 position = position + velocity * step + 0.5 * accel * step * step
                 velocity = velocity + accel * step
             previous_time = stamp
             accel = self._map_accel(sample, rotation)
         tail = end - previous_time
-        if tail > 0:
+        if 0 < tail <= _MAX_IMU_STEP:
             position = position + velocity * tail + 0.5 * accel * tail * tail
         if not np.all(np.isfinite(position)) or np.linalg.norm(position) > max_norm:
             return None
@@ -818,12 +954,12 @@ class ImuTrack:
             if stamp > end:
                 break
             step = stamp - previous_time
-            if step > 0:
+            if 0 < step <= _MAX_IMU_STEP:
                 rotation = rotation @ rodrigues(rate * step)
             previous_time = stamp
             rate = gyro
         tail = end - previous_time
-        if tail > 0:
+        if 0 < tail <= _MAX_IMU_STEP:
             rotation = rotation @ rodrigues(rate * tail)
         return rotation
 
