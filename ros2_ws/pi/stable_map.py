@@ -5,8 +5,11 @@ The first cloud is the map. Each later cloud is pulled onto those surfaces
 (so a wall stays one wall) and only points that see new space are added.
 A repeat of the same surface is not stored again: the lidar's range wanders
 by about a centimetre, which is wider than the 2.5 mm spacing of new points.
-The IMU orientation is the direction the lidar is actually facing, measured
-from that first cloud. The gyro turn is used only when the orientation is missing.
+The IMU orientation is the direction the lidar is facing, but its heading
+wanders (no compass), so the offset between it and the map is re-measured
+every time a sweep seats on the walls. Each sweep is also straightened for
+the turning and travel that happened while it was being captured.
+The gyro turn is used only when the orientation is missing.
 The move since the last kept sweep comes from the IMU's own clock (the cloud
 stamp is a different clock) plus the speed of the last sweep that lined up.
 Walk, turn, and lift freely. A sweep that sits on the walls is stored.
@@ -24,10 +27,18 @@ on the drone. Ctrl-C stops. ~/map.pcd is rewritten every few seconds.
 """
 
 import argparse
+import threading
 import time
+from bisect import bisect_left
+from collections import deque
 from pathlib import Path
 
 import numpy as np
+
+try:  # python3-scipy. Optional: everything still runs without it, only slower.
+    from scipy.spatial import cKDTree
+except ImportError:
+    cKDTree = None
 
 SOURCE_CAP = 1500
 TARGET_CAP = 3000
@@ -49,6 +60,14 @@ REACQUIRE_RADIUS = 2.0
 NEAR_MISS = 0.35
 IMU_HISTORY = 4.0
 MOTION_GAP = 3.0
+# How long the pose may coast on the accelerometer after the walls were last seen.
+COAST_LIMIT = 1.5
+# How far a match may turn the room away from the corrected IMU facing: this
+# much, plus this much per second since the walls last agreed.
+HEADING_TRUST_DEG = 8.0
+HEADING_WANDER_DEG_S = 2.0
+# A change in speed larger than this between two sweeps is a bad accelerometer reading.
+SPEED_STEP_LIMIT = 4.0
 
 
 def write_pcd(path: Path, pts: np.ndarray) -> None:
@@ -136,48 +155,55 @@ def apply_pose(rotation, translation, xyz):
 
 
 def estimate_normals(xyz, radius=0.3):
-    """Outward-facing plane normals. Rows are zero where the neighborhood is not flat."""
+    """Outward-facing plane normals. Rows are zero where the neighborhood is not flat.
+
+    Each point takes the plane through its own cell and the 26 around it.
+    The sums are kept per cell and added up for all cells at once: one cell at a
+    time in Python was the slowest part of every sweep.
+    """
     xyz = np.asarray(xyz, dtype=np.float64)
     normals = np.zeros((len(xyz), 3))
     if len(xyz) < 8:
         return normals
     voxel = radius / 2
     keys = np.floor(xyz / voxel).astype(np.int64)
-    order = np.lexsort((keys[:, 2], keys[:, 1], keys[:, 0]))
-    sorted_keys = keys[order]
-    if len(sorted_keys) == 1:
-        bounds = np.array([0, 1])
-    else:
-        changes = np.any(sorted_keys[1:] != sorted_keys[:-1], axis=1)
-        bounds = np.concatenate((
-            [0], np.flatnonzero(changes) + 1, [len(sorted_keys)]
-        ))
-    buckets = {
-        (int(sorted_keys[start, 0]), int(sorted_keys[start, 1]), int(sorted_keys[start, 2])): order[start:end]
-        for start, end in zip(bounds[:-1], bounds[1:])
-    }
-    offsets = [(a, b, c) for a in (-1, 0, 1) for b in (-1, 0, 1) for c in (-1, 0, 1)]
-    for key, members in buckets.items():
-        neighbor_ids = []
-        for offset in offsets:
-            found = buckets.get((key[0] + offset[0], key[1] + offset[1], key[2] + offset[2]))
-            if found is not None:
-                neighbor_ids.append(found)
-        if not neighbor_ids:
-            continue
-        neighbors = np.concatenate(neighbor_ids)
-        if len(neighbors) < 6:
-            continue
-        pts = xyz[neighbors]
-        _center, cov = _covariance(pts)
-        eigvals, eigvecs = np.linalg.eigh(cov)
-        if eigvals[1] < 1e-8 or eigvals[0] / eigvals[1] > 0.35:
-            continue
-        normal = eigvecs[:, 0]
-        if normal @ pts.mean(axis=0) > 0:
-            normal = -normal
-        normals[members] = normal
-    return normals
+    low = keys.min(axis=0) - 1
+    span = keys.max(axis=0) - low + 2
+    if float(span[0]) * float(span[1]) * float(span[2]) >= 2 ** 62:
+        return normals
+    packed = ((keys[:, 0] - low[0]) * span[1] + (keys[:, 1] - low[1])) * span[2] + (keys[:, 2] - low[2])
+    cells, member = np.unique(packed, return_inverse=True)
+    count = np.bincount(member, minlength=len(cells)).astype(np.float64)
+    total = np.zeros((len(cells), 3))
+    np.add.at(total, member, xyz)
+    outer = np.zeros((len(cells), 9))
+    np.add.at(outer, member, (xyz[:, :, None] * xyz[:, None, :]).reshape(-1, 9))
+    near_count = np.zeros(len(cells))
+    near_total = np.zeros((len(cells), 3))
+    near_outer = np.zeros((len(cells), 9))
+    for a in (-1, 0, 1):
+        for b in (-1, 0, 1):
+            for c in (-1, 0, 1):
+                wanted = cells + (a * span[1] + b) * span[2] + c
+                at = np.searchsorted(cells, wanted)
+                at[at >= len(cells)] = 0
+                found = cells[at] == wanted
+                near_count[found] += count[at[found]]
+                near_total[found] += total[at[found]]
+                near_outer[found] += outer[at[found]]
+    enough = near_count >= 6
+    if not np.any(enough):
+        return normals
+    mean = near_total[enough] / near_count[enough, None]
+    cov = (near_outer[enough] / near_count[enough, None]).reshape(-1, 3, 3) - mean[:, :, None] * mean[:, None, :]
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    flat = (eigvals[:, 1] >= 1e-8) & (eigvals[:, 0] <= 0.35 * np.maximum(eigvals[:, 1], 1e-300))
+    normal = eigvecs[:, :, 0]
+    normal = np.where((np.einsum("ij,ij->i", normal, mean) > 0)[:, None], -normal, normal)
+    normal[~flat] = 0.0
+    cell_normal = np.zeros((len(cells), 3))
+    cell_normal[enough] = normal
+    return cell_normal[member]
 
 
 # Cells around a stored point that still count as the same surface.
@@ -208,6 +234,13 @@ def correspondences(source, target, max_distance):
     """Nearest target index for each source point inside max_distance. -1 if none."""
     matched = np.full(len(source), -1, dtype=np.int64)
     if len(source) == 0 or len(target) == 0:
+        return matched
+    if cKDTree is not None:
+        # Same answer as the comparison below, several times faster. A sweep has
+        # to finish before the lidar has moved out of reach of the next one.
+        distance, nearest = cKDTree(target).query(source, distance_upper_bound=max_distance * (1 + 1e-12))
+        keep = np.isfinite(distance)
+        matched[keep] = nearest[keep]
         return matched
     limit = max_distance * max_distance
     chunk = 250
@@ -807,6 +840,8 @@ class StableMap:
         self.gate = novelty_gate(self.voxel)
         self.occupied = set()
         self._bins = {}
+        self._cell_tree = None
+        self._cell_tree_size = 0
         self._capacity = 0
         self._count = 0
         self._points = np.empty((0, 4), dtype=np.float32)
@@ -839,6 +874,13 @@ class StableMap:
             return np.ones(count, dtype=bool)
         keys = np.floor(xyz / self.gate).astype(np.int64)
         occupied = self._bins
+        if cKDTree is not None:
+            # "Within four cells in every direction" is a largest-axis distance of 4.
+            if self._cell_tree is None or self._cell_tree_size != len(occupied):
+                self._cell_tree = cKDTree(np.array(list(occupied.keys()), dtype=np.float64))
+                self._cell_tree_size = len(occupied)
+            reach, _ = self._cell_tree.query(keys.astype(np.float64), p=np.inf, distance_upper_bound=4.5)
+            return ~np.isfinite(reach)
         mask = np.ones(count, dtype=bool)
         for index in range(count):
             x = int(keys[index, 0])
@@ -898,14 +940,31 @@ class StableMap:
 
 
 class ImuTrack:
-    """Facing from the IMU quaternion, with gyro integration as the fallback."""
+    """Facing from the IMU quaternion, with gyro integration as the fallback.
+
+    The L2's IMU has no compass, so the heading in its quaternion wanders away
+    from the room over time. Roll and pitch do not, because gravity pins them.
+    ``correction`` is the rotation that turns the IMU's orientation into the
+    lidar's facing in the map. It starts as the facing of the first cloud and is
+    then re-measured, about the vertical only, every time a sweep seats on the
+    walls. Reading the raw quaternion against the first cloud forever (the old
+    behaviour) hands every sweep the whole accumulated heading error again.
+    """
 
     def __init__(self):
         self.samples = []
         self.accel = []
         self.orientation = None
         self.origin = None
+        self.correction = None
         self.gravity = None
+        # (IMU stamp, rotation), so a sweep can ask where the lidar was facing
+        # when each part of it was captured, not where it faces once the Pi
+        # gets round to the sweep.
+        self.facings = []
+        self._facing_stamps = []
+        # (IMU stamp, arrival on the Pi's clock). Clouds are timed by arrival.
+        self._arrivals = []
         # IMU header stamps already consumed. The cloud header is a different
         # clock, so motion is measured from these cursors, not from the cloud.
         self._gyro_cursor = None
@@ -920,12 +979,60 @@ class ImuTrack:
         while len(self.samples) > 2 and self.samples[0][0] < cutoff:
             self.samples.pop(0)
 
-    def push_orientation(self, quat):
-        """Keep the latest orientation. Cloud and IMU stamps often do not overlap."""
+    def push_orientation(self, quat, stamp=None, arrival=None):
+        """Keep the latest orientation, and its history when the IMU stamp is given.
+
+        ``arrival`` is when the message reached the Pi, on the Pi's own clock.
+        The cloud header is a different clock from the IMU header, so a sweep
+        is placed on the IMU clock by when it arrived.
+        """
         rotation = quat_xyzw_to_rot(quat)
         if rotation is None:
             return
         self.orientation = rotation
+        if stamp is None:
+            return
+        stamp = float(stamp)
+        if self._facing_stamps and stamp <= self._facing_stamps[-1]:
+            if stamp > self._facing_stamps[-1] - 1.0:
+                return
+            # The IMU clock stepped back (driver restarted). Old history is useless.
+            self.facings.clear()
+            self._facing_stamps.clear()
+            self._arrivals.clear()
+        self.facings.append(rotation)
+        self._facing_stamps.append(stamp)
+        if arrival is not None:
+            self._arrivals.append((stamp, float(arrival)))
+        cutoff = stamp - IMU_HISTORY
+        drop = bisect_left(self._facing_stamps, cutoff)
+        if drop > 256:
+            del self.facings[:drop]
+            del self._facing_stamps[:drop]
+            self._arrivals = [pair for pair in self._arrivals if pair[0] >= cutoff]
+
+    def imu_time(self, arrival):
+        """IMU-clock time of something that reached the Pi at ``arrival``. None without IMU arrivals.
+
+        Messages queue up while a sweep is being worked on, so one arrival can
+        be late. The quickest delivery in the history is the true offset.
+        """
+        if not self._arrivals:
+            return None
+        return float(arrival) - min(arrived - stamp for stamp, arrived in self._arrivals)
+
+    def orientation_at(self, stamp):
+        """IMU orientation at an IMU stamp. Falls back to the latest when there is no history."""
+        if stamp is None or not self._facing_stamps:
+            return self.orientation
+        index = bisect_left(self._facing_stamps, float(stamp))
+        if index <= 0:
+            return self.facings[0]
+        if index >= len(self.facings):
+            return self.facings[-1]
+        before = self._facing_stamps[index - 1]
+        after = self._facing_stamps[index]
+        return self.facings[index if after - stamp < stamp - before else index - 1]
 
     def push_accel(self, stamp, accel):
         """Specific force in the body frame, with the orientation at that moment."""
@@ -941,16 +1048,48 @@ class ImuTrack:
         """Remember the facing at the first cloud. Later clouds are measured from it."""
         if self.origin is None and self.orientation is not None:
             self.origin = np.array(self.orientation, copy=True)
+            self.correction = self.origin.T.copy()
+
+    def correct(self, map_rotation, stamp=None):
+        """Re-measure the heading offset from a sweep that seated on the walls.
+
+        ``map_rotation`` is the lidar's facing in the map that the walls agreed
+        on at IMU time ``stamp``. Only the turn about the vertical is taken from
+        it: the IMU already knows which way is down, and letting a slightly
+        tilted match overwrite that would lean every later sweep.
+        Returns the heading change in degrees.
+        """
+        measured = self.orientation_at(stamp)
+        if self.correction is None or measured is None:
+            return 0.0
+        error = np.asarray(map_rotation, dtype=np.float64) @ (self.correction @ measured).T
+        angle = 0.0
+        if self.gravity is not None and np.linalg.norm(self.gravity) > 1.0:
+            up = self.gravity / np.linalg.norm(self.gravity)
+            half_cos = 0.5 * np.sqrt(max(0.0, 1.0 + np.trace(error)))
+            if half_cos > 1e-3:
+                axis = np.array([
+                    error[2, 1] - error[1, 2], error[0, 2] - error[2, 0], error[1, 0] - error[0, 1],
+                ]) / (4.0 * half_cos)
+                angle = 2.0 * np.arctan2(axis @ up, half_cos)
+                error = rodrigues(up * angle)
+        else:
+            angle = _rotation_angle(error)
+        fixed = error @ self.correction
+        # Thousands of small products drift off a true rotation. Square it up.
+        u, _, vt = np.linalg.svd(fixed)
+        self.correction = u @ vt
+        return float(np.degrees(angle))
 
     def lock_gravity(self):
         """The still reading, in the map, is gravity. Later moves are measured from it."""
         if self.gravity is not None or self.origin is None or len(self.accel) < 5:
             return
-        samples = [self.origin.T @ rotation @ accel for _, accel, rotation in self.accel]
+        samples = [self.correction @ rotation @ accel for _, accel, rotation in self.accel]
         self.gravity = np.mean(samples, axis=0)
 
     def _map_accel(self, accel, rotation):
-        return self.origin.T @ rotation @ np.asarray(accel, dtype=np.float64) - self.gravity
+        return self.correction @ rotation @ np.asarray(accel, dtype=np.float64) - self.gravity
 
     def shift_since(self, start, end, max_gap=0.5, max_norm=0.75):
         """Map displacement from the accelerometer, or None when gravity or the gap is missing.
@@ -959,6 +1098,17 @@ class ImuTrack:
         accepted move; this integral is only the extra acceleration in the gap.
         ``max_gap`` keeps a stale clock from integrating for several seconds and
         shoving the pose off the map.
+        """
+        moved = self.motion_since(start, end, max_gap)
+        if moved is None or np.linalg.norm(moved[0]) > max_norm:
+            return None
+        return moved[0]
+
+    def motion_since(self, start, end, max_gap=0.5):
+        """(displacement from rest, change in velocity) between two IMU stamps, in the map. None if unknown.
+
+        The change in velocity is what lets a carried speed slow down again.
+        Without it a lidar that had been moving was assumed to keep moving.
         """
         if self.gravity is None or self.origin is None or not self.accel or end < start:
             return None
@@ -986,21 +1136,22 @@ class ImuTrack:
         tail = end - previous_time
         if 0 < tail <= _MAX_IMU_STEP:
             position = position + velocity * tail + 0.5 * accel * tail * tail
-        if not np.all(np.isfinite(position)) or np.linalg.norm(position) > max_norm:
+            velocity = velocity + accel * tail
+        if not np.all(np.isfinite(position)) or not np.all(np.isfinite(velocity)):
             return None
-        return position
+        return position, velocity
 
-    def advance(self):
-        """Mark the IMU samples so far as already used by a kept sweep."""
+    def advance(self, until=None):
+        """Mark the IMU samples up to ``until`` (default: all so far) as used by a kept sweep."""
         if self.samples:
-            self._gyro_cursor = self.samples[-1][0]
+            self._gyro_cursor = self.samples[-1][0] if until is None else min(self.samples[-1][0], until)
         if self.accel:
-            self._accel_cursor = self.accel[-1][0]
+            self._accel_cursor = self.accel[-1][0] if until is None else min(self.accel[-1][0], until)
 
-    def _preview_span(self, series, cursor):
+    def _preview_span(self, series, cursor, until=None):
         if len(series) < 2:
             return None
-        end = series[-1][0]
+        end = series[-1][0] if until is None else min(series[-1][0], until)
         start = end if cursor is None else cursor
         if end <= start:
             return None
@@ -1008,25 +1159,26 @@ class ImuTrack:
             start = end - MOTION_GAP
         return start, end
 
-    def preview_shift(self):
+    def preview_shift(self, until=None):
         """Accel move since the last kept sweep, on the IMU clock."""
-        span = self._preview_span(self.accel, self._accel_cursor)
+        span = self._preview_span(self.accel, self._accel_cursor, until)
         if span is None:
             return None
         return self.shift_since(span[0], span[1], max_gap=MOTION_GAP, max_norm=STEP_LIMIT)
 
-    def preview_rotation(self):
+    def preview_rotation(self, until=None):
         """Gyro turn since the last kept sweep, on the IMU clock."""
-        span = self._preview_span(self.samples, self._gyro_cursor)
+        span = self._preview_span(self.samples, self._gyro_cursor, until)
         if span is None:
             return None
         return self.rotation_since(span[0], span[1])
 
-    def facing_in_map(self):
-        """Map-from-lidar rotation since the first cloud, or None if it is not known."""
-        if self.orientation is None or self.origin is None:
+    def facing_in_map(self, stamp=None):
+        """Lidar facing in the map at an IMU stamp (default: now), or None if it is not known."""
+        measured = self.orientation_at(stamp)
+        if measured is None or self.correction is None:
             return None
-        return self.origin.T @ self.orientation
+        return self.correction @ measured
 
     def rotation_since(self, start, end):
         """Rotation of the sensor body from start to end, or None if the gap has no gyro."""
@@ -1075,7 +1227,8 @@ class Tracker:
             return
         self.speed = self.step / seconds
 
-    def add_scan(self, xyz, intensity=None, rotation_hint=None, facing=None, translation_hint=None, carried=None):
+    def add_scan(self, xyz, intensity=None, rotation_hint=None, facing=None, translation_hint=None, carried=None,
+                 facing_tolerance=None):
         xyz = np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
         if intensity is None:
             intensity = np.ones(len(xyz), dtype=np.float64)
@@ -1142,6 +1295,9 @@ class Tracker:
                 xyz, normals, self.map.xyz(), self.map.normals(),
                 guess_rotation, guess_translation, self.max_correspondence,
             )
+            if ok and facing_tolerance is not None and facing is not None:
+                if _rotation_angle(rotation @ guess_rotation.T) > facing_tolerance:
+                    ok, fit = False, None
             if ok:
                 break
         self.last_fit = fit
@@ -1179,22 +1335,222 @@ class Tracker:
         return "aligned"
 
 
-def collect(seconds_between_saves, topic, imu_topic, output, voxel, max_correspondence):
+def sweep_offsets(point_time):
+    """Seconds before the end of the sweep at which each point was captured (zero or negative).
+
+    The driver glues many packets into one cloud and restarts the ``time``
+    field at zero in each packet, so the field alone only places a point inside
+    its own line. The restarts mark the packets, and the packets are evenly
+    spaced. Returns None when the cloud carries no usable time.
+    """
+    if point_time is None:
+        return None
+    point_time = np.asarray(point_time, dtype=np.float64).reshape(-1)
+    if len(point_time) < 2 or not np.all(np.isfinite(point_time)):
+        return None
+    if point_time.min() < 0 or point_time.max() > 0.5:
+        return None
+    restart = np.diff(point_time) < 0
+    packet = np.concatenate(([0], np.cumsum(restart)))
+    steps = np.diff(point_time)[~restart]
+    steps = steps[steps > 0]
+    if len(steps) == 0:
+        return None
+    # A packet's last returns can be dropped as out of range, so the longest
+    # packet seen is the best measure of the spacing between packets.
+    period = float(point_time.max() + np.median(steps))
+    offsets = (packet - packet[-1]) * period + point_time - period
+    return offsets
+
+
+def deskew(xyz, offsets, imu, end_stamp, velocity=None, facing=None):
+    """Redraw a sweep as if every point had been captured at the end of it.
+
+    A sweep takes about a third of a second. A lidar that turns or travels in
+    that time smears the walls across the cloud, and the smeared cloud then
+    seats on the map at the wrong angle. Each packet is turned by how far the
+    IMU says the lidar rotated between that packet and the end of the sweep.
+    With ``velocity`` (map frame) and ``facing`` (map from lidar at the end),
+    the distance travelled is taken out too.
+    """
+    xyz = np.asarray(xyz, dtype=np.float64)
+    if offsets is None or end_stamp is None or len(xyz) != len(offsets) or not imu.facings:
+        return xyz
+    end_rotation = imu.orientation_at(end_stamp)
+    drift = None
+    if velocity is not None and facing is not None and np.linalg.norm(velocity) > 1e-3:
+        drift = np.asarray(facing, dtype=np.float64).T @ np.asarray(velocity, dtype=np.float64)
+    out = np.empty_like(xyz)
+    # About 5 ms per packet: one orientation per packet is as fine as the IMU reports.
+    slot = np.round(offsets / 0.004).astype(np.int64)
+    order = np.argsort(slot, kind="stable")
+    bounds = np.concatenate(([0], np.flatnonzero(np.diff(slot[order])) + 1, [len(order)]))
+    for first, last in zip(bounds[:-1], bounds[1:]):
+        members = order[first:last]
+        before_end = float(offsets[members].mean())
+        turn = end_rotation.T @ imu.orientation_at(end_stamp + before_end)
+        moved = xyz[members] @ turn.T
+        if drift is not None:
+            moved = moved + drift * before_end
+        out[members] = moved
+    return out
+
+
+class Mapper:
+    """The mapping loop without ROS: feed it IMU messages and clouds as they arrive.
+
+    The Pi script and the simulator both drive this, so what is tested at a
+    desk is what runs on the aircraft.
+    """
+
+    def __init__(self, voxel=DEFAULT_VOXEL, max_correspondence=0.4, deskew_sweeps=True,
+                 correct_heading=True):
+        self.tracker = Tracker(voxel, max_correspondence)
+        self.imu = ImuTrack()
+        self.deskew_sweeps = deskew_sweeps
+        self.correct_heading = correct_heading
+        self.counts = {"seed": 0, "aligned": 0, "tracking": 0, "skipped": 0}
+        self.last_kept = None
+        self.last_end = None           # IMU-clock end of the last sweep that moved the pose
+        self.last_aligned = None       # arrival of the last sweep that seated on the walls
+        self.misses = 0                # sweeps in a row that did not seat
+        self.heading_fix_deg = 0.0     # running total the walls have corrected the IMU heading by
+        self.last = {}
+
+    def on_imu(self, stamp, quat, gyro, accel, arrival=None):
+        """One IMU message. ``stamp`` is its header time; ``arrival`` is the Pi's clock."""
+        self.imu.push(stamp, gyro)
+        self.imu.push_orientation(quat, stamp, stamp if arrival is None else arrival)
+        self.imu.push_accel(stamp, accel)
+
+    def on_cloud(self, arrival, xyz, intensity=None, point_time=None):
+        """One cloud. ``arrival`` is when it reached the Pi; the sweep ended about then."""
+        tracker, imu = self.tracker, self.imu
+        xyz = np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
+        end = imu.imu_time(arrival)
+        facing = None if len(tracker.map) == 0 else imu.facing_in_map(end)
+        # Without walls to check against, the accelerometer is only good for
+        # about a second. Past that, coasting on it carries the pose out of the
+        # room, where it can never find the walls again. Stay put and search.
+        lost = (
+            self.misses > 0 and self.last_aligned is not None
+            and arrival - self.last_aligned > COAST_LIMIT
+        )
+        if lost:
+            tracker.speed = np.zeros(3)
+        if self.deskew_sweeps and end is not None:
+            offsets = sweep_offsets(point_time)
+            velocity = tracker.speed
+            if offsets is not None and self.last_end is not None and not lost:
+                # tracker.speed is the speed at the end of the last sweep. The
+                # accelerometer brings it up to the middle of this one.
+                gained = imu.motion_since(self.last_end, end + 0.5 * float(offsets.min()), MOTION_GAP)
+                if gained is not None and np.linalg.norm(gained[1]) < SPEED_STEP_LIMIT:
+                    velocity = velocity + gained[1]
+            xyz = deskew(xyz, offsets, imu, end,
+                         velocity=velocity, facing=facing if facing is not None else tracker.rotation)
+        delta = imu.preview_rotation(end)
+        shift = None if lost else imu.preview_shift(end)
+        carried = None
+        if self.last_kept is not None:
+            elapsed = arrival - self.last_kept
+            if lost:
+                carried = np.zeros(3)
+            elif 0.02 < elapsed <= MOTION_GAP:
+                carried = tracker.speed * elapsed
+        # The map frame is the IMU frame of the cloud that actually seeds it.
+        # If that quaternion arrives one cloud late, adopt it only while the
+        # lidar is still at the start. A later quaternion must not redefine
+        # the room.
+        if (
+            imu.origin is None
+            and len(tracker.map) > 0
+            and self.counts["aligned"] == 0
+            and np.allclose(tracker.rotation, np.eye(3))
+        ):
+            imu.lock_origin()
+            facing = imu.facing_in_map(end)
+        # The corrected IMU facing can only be off by what the heading has
+        # wandered since the walls last agreed. A match that turns the room much
+        # further than that is the wrong wall (a square room fits itself a
+        # quarter turn round), and keeping it would also teach that quarter
+        # turn to every later sweep.
+        tolerance = None
+        if facing is not None and self.correct_heading and self.counts["aligned"] > 0:
+            since = 0.0 if self.last_aligned is None else max(0.0, arrival - self.last_aligned)
+            tolerance = np.radians(min(HEADING_TRUST_DEG + HEADING_WANDER_DEG_S * since, 45.0))
+        status = tracker.add_scan(
+            xyz, intensity,
+            rotation_hint=delta,
+            facing=facing,
+            translation_hint=shift,
+            carried=carried,
+            facing_tolerance=tolerance,
+        )
+        self.misses = 0 if status in ("seed", "aligned") else self.misses + 1
+        if status == "seed":
+            imu.lock_origin()
+        if imu.gravity is None and np.linalg.norm(tracker.translation) < 0.02:
+            imu.lock_gravity()
+        if status == "aligned" and self.correct_heading:
+            # The walls have just said where the lidar is really facing. Carry
+            # that into the next sweep's starting guess instead of throwing it away.
+            self.heading_fix_deg += imu.correct(tracker.rotation, end)
+        if status in ("seed", "aligned"):
+            self.last_aligned = arrival
+        if status != "skipped":
+            if self.last_kept is not None:
+                tracker.note_elapsed(arrival - self.last_kept)
+                # That is the average speed since the last sweep. Half of what
+                # the accelerometer saw in between makes it the speed right now.
+                gained = None
+                if self.last_end is not None and end is not None:
+                    gained = imu.motion_since(self.last_end, end, MOTION_GAP)
+                if gained is not None and np.linalg.norm(gained[1]) < SPEED_STEP_LIMIT:
+                    tracker.speed = tracker.speed + 0.5 * gained[1]
+            imu.advance(end)
+            self.last_kept = arrival
+            self.last_end = end
+        self.counts[status] += 1
+        self.last = {"status": status, "gyro_turn": delta}
+        return status
+
+    def status_line(self):
+        tracker, imu, counts = self.tracker, self.imu, self.counts
+        place = tracker.translation
+        fit = "  --" if tracker.last_fit is None else f"{tracker.last_fit * 100:4.1f}cm"
+        reported = imu.facing_in_map()
+        face = "  --" if reported is None else f"{heading_deg(reported):5.1f}°"
+        imu_on = imu.orientation is not None or len(imu.samples) >= 2
+        return (
+            f"{self.last.get('status', 'waiting')}: map {len(tracker.map)} points, "
+            f"lidar at {place[0]:.2f} {place[1]:.2f} {place[2]:.2f} m, "
+            f"yaw={heading_deg(tracker.rotation):5.1f}° face={face} "
+            f"imu heading fix={self.heading_fix_deg:+.1f}°, "
+            f"wall fit {fit}, imu {'on' if imu_on else 'off'}, "
+            f"aligned {counts['aligned']}, tracking {counts['tracking']}, "
+            f"skipped {counts['skipped']}"
+        )
+
+
+def collect(seconds_between_saves, topic, imu_topic, output, voxel, max_correspondence,
+            deskew_sweeps=True, correct_heading=True):
     import rclpy
+    from rclpy.executors import ExternalShutdownException
     from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
     from sensor_msgs.msg import Imu, PointCloud2
     from sensor_msgs_py import point_cloud2
 
     rclpy.init()
     node = rclpy.create_node("stable_map")
-    tracker = Tracker(voxel, max_correspondence)
-    imu = ImuTrack()
-    pending = {}
+    mapper = Mapper(voxel, max_correspondence, deskew_sweeps, correct_heading)
+    tracker = mapper.tracker
+    # Messages are received on their own thread and stamped as they arrive.
+    # Taking them one at a time between sweeps left the IMU reading seconds
+    # stale whenever a sweep took longer than the gap between clouds.
+    imu_inbox = deque(maxlen=4000)
+    cloud_inbox = deque(maxlen=1)      # only the newest sweep is worth working on
     last_save = time.monotonic()
-    last_kept = None
-    counts = {"seed": 0, "aligned": 0, "tracking": 0, "skipped": 0}
-    # The sensor profile keeps five messages. A sweep used to take long enough
-    # that the gyro and accel samples in between were thrown away.
     imu_qos = QoSProfile(
         reliability=ReliabilityPolicy.BEST_EFFORT,
         history=HistoryPolicy.KEEP_LAST,
@@ -1202,24 +1558,30 @@ def collect(seconds_between_saves, topic, imu_topic, output, voxel, max_correspo
     )
 
     def on_cloud(msg: PointCloud2) -> None:
-        pending["msg"] = msg
+        cloud_inbox.append((time.monotonic(), msg))
 
     def on_imu(msg: Imu) -> None:
-        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-        imu.push(stamp, [
-            msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z
-        ])
-        imu.push_orientation([
-            msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w
-        ])
-        imu.push_accel(stamp, [
-            msg.linear_acceleration.x,
-            msg.linear_acceleration.y,
-            msg.linear_acceleration.z,
-        ])
+        imu_inbox.append((
+            time.monotonic(),
+            msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9,
+            (msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w),
+            (msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z),
+            (msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z),
+        ))
 
     node.create_subscription(PointCloud2, topic, on_cloud, qos_profile_sensor_data)
     node.create_subscription(Imu, imu_topic, on_imu, imu_qos)
+
+    def receive():
+        try:
+            rclpy.spin(node)
+        except (ExternalShutdownException, KeyboardInterrupt):
+            pass
+        except Exception as error:  # the context can already be gone at shutdown
+            if rclpy.ok():
+                print(f"receiver stopped: {error}", flush=True)
+
+    threading.Thread(target=receive, daemon=True).start()
     print(
         f"mapping {topic} into {output} with about {voxel * 1000:.1f} mm between points"
         " — hold still until the count levels off, then move it freely",
@@ -1233,81 +1595,40 @@ def collect(seconds_between_saves, topic, imu_topic, output, voxel, max_correspo
         write_pcd(output, cloud)
         print(f"wrote {len(cloud)} fixed points to {output}", flush=True)
 
+    def read(msg):
+        names = {field.name for field in msg.fields}
+        wanted = ["x", "y", "z"] + [name for name in ("intensity", "time") if name in names]
+        points = point_cloud2.read_points(msg, field_names=wanted, skip_nans=True)
+        xyz = np.column_stack((points["x"], points["y"], points["z"])).astype(np.float64)
+        intensity = (
+            np.asarray(points["intensity"], dtype=np.float64) if "intensity" in names
+            else np.ones(len(xyz))
+        )
+        stamps = np.asarray(points["time"], dtype=np.float64) if "time" in names else None
+        return xyz, intensity, stamps
+
     try:
         while rclpy.ok():
-            rclpy.spin_once(node, timeout_sec=0.2)
-            msg = pending.pop("msg", None)
-            if msg is None:
+            if not cloud_inbox:
+                time.sleep(0.005)
                 if tracker.map and time.monotonic() - last_save >= seconds_between_saves:
                     save()
                     last_save = time.monotonic()
                 continue
+            arrival, msg = cloud_inbox.popleft()
+            while imu_inbox:
+                arrived, stamp, quat, gyro, accel = imu_inbox.popleft()
+                mapper.on_imu(stamp, quat, gyro, accel, arrival=arrived)
             try:
-                points = point_cloud2.read_points(
-                    msg, field_names=["x", "y", "z", "intensity"], skip_nans=True
-                )
-                xyz = np.column_stack((points["x"], points["y"], points["z"]))
-                intensity = np.asarray(points["intensity"], dtype=np.float64)
+                xyz, intensity, stamps = read(msg)
             except (AssertionError, ValueError):
                 xyz = point_cloud2.read_points_numpy(
                     msg, field_names=["x", "y", "z"], skip_nans=True
                 )
-                intensity = np.ones(len(xyz))
-            # The cloud header and the IMU header do not share a clock, so a
-            # window between those stamps is empty and the guess stays put.
-            # Integrate the IMU samples on their own stamps instead.
-            now = time.monotonic()
-            delta = imu.preview_rotation()
-            shift = imu.preview_shift()
-            carried = None
-            if last_kept is not None:
-                elapsed = now - last_kept
-                if 0.02 < elapsed <= MOTION_GAP:
-                    carried = tracker.speed * elapsed
-            # The map frame is the IMU frame of the cloud that actually seeds it.
-            # If that quaternion arrives one cloud late, adopt it only while the
-            # lidar is still at the start. A later quaternion must not redefine
-            # the room.
-            if (
-                imu.origin is None
-                and len(tracker.map) > 0
-                and counts["aligned"] == 0
-                and np.allclose(tracker.rotation, np.eye(3))
-            ):
-                imu.lock_origin()
-            facing = None if len(tracker.map) == 0 else imu.facing_in_map()
-            status = tracker.add_scan(
-                xyz, intensity,
-                rotation_hint=delta,
-                facing=facing,
-                translation_hint=shift,
-                carried=carried,
-            )
-            if status == "seed":
-                imu.lock_origin()
-            if imu.gravity is None and np.linalg.norm(tracker.translation) < 0.02:
-                imu.lock_gravity()
-            if status != "skipped":
-                if last_kept is not None:
-                    tracker.note_elapsed(now - last_kept)
-                imu.advance()
-                last_kept = time.monotonic()
-            counts[status] += 1
-            place = tracker.translation
-            fit = "  --" if tracker.last_fit is None else f"{tracker.last_fit * 100:4.1f}cm"
-            dimu = "  --" if delta is None else f"{heading_deg(delta):5.1f}°"
-            reported = imu.facing_in_map()
-            face = "  --" if reported is None else f"{heading_deg(reported):5.1f}°"
-            imu_on = imu.orientation is not None or len(imu.samples) >= 2
-            print(
-                f"{status}: map {len(tracker.map)} points, "
-                f"lidar at {place[0]:.2f} {place[1]:.2f} {place[2]:.2f} m, "
-                f"yaw={heading_deg(tracker.rotation):5.1f}° face={face} dIMU={dimu}, "
-                f"wall fit {fit}, imu {'on' if imu_on else 'off'}, "
-                f"aligned {counts['aligned']}, tracking {counts['tracking']}, "
-                f"skipped {counts['skipped']}",
-                flush=True,
-            )
+                intensity, stamps = np.ones(len(xyz)), None
+            started = time.monotonic()
+            mapper.on_cloud(arrival, xyz, intensity, stamps)
+            print(f"{mapper.status_line()}, {time.monotonic() - started:.2f} s", flush=True)
             if tracker.map and time.monotonic() - last_save >= seconds_between_saves:
                 save()
                 last_save = time.monotonic()
@@ -1315,7 +1636,6 @@ def collect(seconds_between_saves, topic, imu_topic, output, voxel, max_correspo
         pass
     finally:
         save()
-        node.destroy_node()
         rclpy.try_shutdown()
 
 
@@ -1337,6 +1657,14 @@ def main():
         help="how far a new sweep may start from the map and still be pulled onto it",
     )
     parser.add_argument("--save-every", type=float, default=5.0, help="seconds between PCD writes")
+    parser.add_argument(
+        "--no-deskew", action="store_true",
+        help="do not straighten sweeps captured while the lidar was moving (for comparison)",
+    )
+    parser.add_argument(
+        "--no-heading-correction", action="store_true",
+        help="read the raw IMU heading against the first cloud forever, as before (for comparison)",
+    )
     args = parser.parse_args()
     if args.voxel <= 0 or args.max_correspondence <= 0 or args.save_every <= 0:
         raise SystemExit("voxel, max-correspondence, and save-every must be greater than 0")
@@ -1347,6 +1675,8 @@ def main():
         Path(args.output).expanduser(),
         args.voxel,
         args.max_correspondence,
+        deskew_sweeps=not args.no_deskew,
+        correct_heading=not args.no_heading_correction,
     )
 
 
