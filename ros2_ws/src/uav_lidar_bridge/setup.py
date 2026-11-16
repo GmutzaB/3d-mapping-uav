@@ -17,12 +17,15 @@ setup(
     zip_safe=True,
     maintainer='GmutzaB',
     maintainer_email='gmutzab@gmail.com',
-    description='Unitree L2 and MAVROS launch files plus a LiDAR obstacle sector node.',
+    description='Unitree L2 and MAVROS launch files, LiDAR obstacle sectors, and 3D scan recording.',
     license='TODO',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'obstacle_sectors = uav_lidar_bridge.obstacle_node:main',
+            'scan_recorder = uav_lidar_bridge.scan_recorder_node:main',
+            'scan_server = uav_lidar_bridge.scan_server:main',
+            'demo_scan = uav_lidar_bridge.demo_scan:main',
         ],
     },
 )

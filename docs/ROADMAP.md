@@ -40,3 +40,14 @@ See [delivery plan](AI_AND_DELIVERY_PLAN.md) and [connection plan](CONNECTION_PL
 - [x] Verify companion frame conversions, latched command gating and MAVLink wire encoding.
 - [x] Exercise synthetic planner/localization loss and operator recovery in offline replay.
 - [ ] Verify the same scenarios against an actual ArduPilot SITL instance.
+
+## November 16 software increment: scan recording
+
+- [x] `scan_recorder` node: pose-interpolated, deskewed, voxel-merged 3D map saved as PLY
+      on disarm, with periodic autosave and a stationary bench mode.
+- [x] `scan_server`: read-only HTTP download of scans for the phone app; `demo_scan`
+      makes simulated scans for app development.
+- [x] Unit tests for interpolation, frames, deskew, voxel merge, PLY output and server
+      path safety (synthetic data only).
+- [ ] Run on the Pi with the real L2: stationary bench scan, then hand-carried with a pose source.
+- [ ] Choose the pose source for indoor flights (LiDAR-inertial odometry vs. FC estimate).

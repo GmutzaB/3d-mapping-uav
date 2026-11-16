@@ -1,0 +1,37 @@
+scan_recorder:
+  ros__parameters:
+    cloud_topic: unilidar/cloud
+
+    # Where the aircraft is. MAVROS local position (ENU) works once ArduPilot has a
+    # position estimate: GPS outdoors, or external navigation indoors.
+    # none = stationary bench scan: the sensor must not move while recording.
+    pose_topic: mavros/local_position/pose
+    state_topic: mavros/state
+
+    # arm    = start on arm, save on disarm (normal flights)
+    # manual = ros2 service call /scan_recorder/start (and /stop) std_srvs/srv/Trigger
+    # always = record from launch until shutdown (bench scans)
+    trigger: arm
+
+    scan_dir: ~/scans
+
+    # One averaged point per cube of this size (m). Smaller = more detail, more memory.
+    voxel_size: 0.05
+    max_voxels: 4000000        # roughly 100 MB of RAM at the cap
+
+    # Ignore returns closer than range_min: props, arms and the frame itself.
+    range_min: 0.35
+    range_max: 30.0
+
+    # Split each cloud by per-point capture time so motion doesn't smear the map.
+    # 1 turns it off.
+    deskew_slices: 8
+    # Don't place a cloud if the pose has a gap longer than this (s) around it.
+    max_pose_gap_s: 0.2
+
+    # Write a partial scan every N seconds during flight (0 = only on disarm).
+    autosave_s: 60.0
+
+    # Downsampled map on /scan_recorder/map for RViz (0 = off).
+    preview_period_s: 2.0
+    preview_max_points: 150000
