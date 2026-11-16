@@ -111,7 +111,7 @@ After a mapper-only change, leave the lidar window running. In the map window, C
 ```sh
 cd ~/3d-mapping-uav
 git fetch origin
-git checkout cursor/lidar-facing-yaw-f923
+git checkout claude/lidar-heading-correction
 git pull
 source /opt/ros/lyrical/setup.bash
 source ~/3d-mapping-uav/ros2_ws/install/setup.bash
