@@ -10,6 +10,7 @@ navigation and mapping; the executable code includes the airflow demonstration a
 - [Aircraft flight dynamics model](docs/FLIGHT_MODEL.md)
 - [Wind-gust rejection (Dryden turbulence)](docs/GUST_REJECTION.md)
 - [AI feasibility and May delivery plan](docs/AI_AND_DELIVERY_PLAN.md)
+- [Flight time, battery and mapping-survey simulations](docs/ENDURANCE_AND_SURVEY.md)
 
 - [Hardware and mass budget](HARDWARE.md)
 - [Proposed system architecture](docs/ARCHITECTURE.md)
@@ -133,6 +134,14 @@ Running `flight_dynamics.py` without arguments generates the stationary hover ex
 Run `flight_control.py` or choose **Feedback control — comparison animation** in VS Code.
 See [controller experiment and results](docs/FEEDBACK_CONTROL.md) for the 10-second
 hover, 10° roll, return, disturbance recovery, side-by-side animation and SITL next steps.
+
+## Flight time and mapping survey
+
+`battery_endurance.py` estimates hover and cruise flight time for the 6S 9000 mAh 80C
+pack, the best cruise speeds, and how flight time changes with weight.
+`survey_flight.py` flies a full lawnmower mapping mission with the 6-DOF model in
+three wind cases and reports time, battery used, path error and coverage.
+See [models, results and what to measure](docs/ENDURANCE_AND_SURVEY.md).
 
 ## ArduCopter SITL mission runner
 

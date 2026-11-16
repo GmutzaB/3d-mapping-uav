@@ -26,7 +26,7 @@
             "cwd": "${workspaceFolder}"
         },
         {
-            "name": "Flight model — shareable roll animation",
+            "name": "Flight model \u2014 shareable roll animation",
             "type": "debugpy",
             "request": "launch",
             "python": "${workspaceFolder}/.venv/bin/python",
@@ -44,7 +44,7 @@
             "cwd": "${workspaceFolder}"
         },
         {
-            "name": "Feedback control — comparison animation",
+            "name": "Feedback control \u2014 comparison animation",
             "type": "debugpy",
             "request": "launch",
             "python": "${workspaceFolder}/.venv/bin/python",
@@ -56,7 +56,7 @@
             "cwd": "${workspaceFolder}"
         },
         {
-            "name": "Flight model — shareable hover animation",
+            "name": "Flight model \u2014 shareable hover animation",
             "type": "debugpy",
             "request": "launch",
             "python": "${workspaceFolder}/.venv/bin/python",
@@ -74,11 +74,35 @@
             "cwd": "${workspaceFolder}"
         },
         {
-            "name": "SITL mission — takeoff, hover, waypoint, land",
+            "name": "SITL mission \u2014 takeoff, hover, waypoint, land",
             "type": "debugpy",
             "request": "launch",
             "python": "${workspaceFolder}/.venv/bin/python",
             "program": "${workspaceFolder}/sitl_mission.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Flight time and battery \u2014 endurance chart",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "windows": {
+                "python": "${workspaceFolder}/.venv/Scripts/python.exe"
+            },
+            "program": "${workspaceFolder}/battery_endurance.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Mapping survey flight \u2014 wind comparison",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "windows": {
+                "python": "${workspaceFolder}/.venv/Scripts/python.exe"
+            },
+            "program": "${workspaceFolder}/survey_flight.py",
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}"
         }

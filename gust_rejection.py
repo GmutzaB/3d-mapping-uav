@@ -228,6 +228,11 @@ class PositionHold:
         error = state[:3] - self.target
         self.integral = np.clip(self.integral - g.ki * error * dt, -g.integral_limit, g.integral_limit)
         accel = -g.kp * error - g.kd * state[3:6] + self.integral
+        return self.command_from_accel(state, accel)
+
+    def command_from_accel(self, state, accel):
+        """Desired world NED acceleration -> tilt + collective -> throttles (saturated?)."""
+        g = self.gains
         # Required specific force (NED): thrust/mass = accel - gravity
         f = accel - np.array([0, 0, G])
         f[2] = min(f[2], -0.3 * G)  # never ask for less than 30% lift

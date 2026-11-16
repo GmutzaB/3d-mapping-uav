@@ -3,13 +3,16 @@
 <package format="3">
   <name>uav_lidar_bridge</name>
   <version>0.1.0</version>
-  <description>Launch files for the Unitree L2 and MAVROS, plus a LiDAR-to-ArduPilot obstacle sector node.</description>
+  <description>Launch files for the Unitree L2 and MAVROS, a LiDAR-to-ArduPilot obstacle sector node, and 3D scan recording.</description>
   <maintainer email="gmutzab@gmail.com">GmutzaB</maintainer>
   <license>TODO</license>
 
   <exec_depend>rclpy</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>sensor_msgs_py</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>mavros_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>

@@ -4,15 +4,7 @@ lidar_obstacle_sectors:
     scan_topic: mavros/obstacle/send
     frame_id: base_link
 
-    # Where the L2 sits on the airframe relative to the body center.
-    # x forward, y left, z up in meters; roll/pitch/yaw in degrees.
-    # Measure these on the real frame. Mounted upside down = roll 180.
-    mount_x: 0.0
-    mount_y: 0.0
-    mount_z: 0.0
-    mount_roll_deg: 0.0
-    mount_pitch_deg: 0.0
-    mount_yaw_deg: 0.0
+    # Where the L2 sits on the airframe: see mount.yaml (shared with scan_recorder).
 
     # Height band (body frame, meters) that counts as level with the aircraft.
     z_min: -0.3

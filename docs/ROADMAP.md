@@ -40,3 +40,21 @@ See [delivery plan](AI_AND_DELIVERY_PLAN.md) and [connection plan](CONNECTION_PL
 - [x] Verify companion frame conversions, latched command gating and MAVLink wire encoding.
 - [x] Exercise synthetic planner/localization loss and operator recovery in offline replay.
 - [ ] Verify the same scenarios against an actual ArduPilot SITL instance.
+
+## November 16 software increment: scan recording
+
+- [x] `scan_recorder` node: pose-interpolated, deskewed, voxel-merged 3D map saved as PLY
+      on disarm, with periodic autosave and a stationary bench mode.
+- [x] `scan_server`: read-only HTTP download of scans for the phone app; `demo_scan`
+      makes simulated scans for app development.
+- [x] Unit tests for interpolation, frames, deskew, voxel merge, PLY output and server
+      path safety (synthetic data only).
+- [ ] Run on the Pi with the real L2: stationary bench scan, then hand-carried with a pose source.
+- [ ] Choose the pose source for indoor flights (LiDAR-inertial odometry vs. FC estimate).
+
+## November 16 software increment: endurance and survey simulation
+
+- [x] Battery/flight-time model for the selected 6S 9000 mAh 80C pack (`battery_endurance.py`).
+- [x] Full mapping-survey flight in wind with battery tracking (`survey_flight.py`).
+- [ ] Weigh battery and airframe; measure hover current to calibrate the power model.
+- [ ] Decide LiDAR mount orientation and the useful swath / line spacing.
