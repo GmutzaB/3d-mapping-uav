@@ -8,6 +8,7 @@ navigation and mapping; the executable code includes the airflow demonstration a
 
 - [Connection and communication plan](docs/CONNECTION_PLAN.md)
 - [Aircraft flight dynamics model](docs/FLIGHT_MODEL.md)
+- [Wind-gust rejection (Dryden turbulence)](docs/GUST_REJECTION.md)
 - [AI feasibility and May delivery plan](docs/AI_AND_DELIVERY_PLAN.md)
 
 - [Hardware and mass budget](HARDWARE.md)
