@@ -280,6 +280,24 @@ def quat_xyzw_to_rot(quat):
     ])
 
 
+# How the four numbers of the IMU quaternion may be laid out: which slot holds w,
+# and whether it turns the lidar into the world or the world into the lidar.
+QUAT_LAYOUTS = (("xyzw", False), ("wxyz", False), ("xyzw", True), ("wxyz", True))
+
+
+def quat_to_rot(quat, order="xyzw", inverse=False):
+    """Lidar-to-world rotation from four quaternion numbers in the given layout. None if unusable."""
+    quat = np.asarray(quat, dtype=np.float64).reshape(-1)
+    if quat.shape != (4,):
+        return None
+    if order == "wxyz":
+        quat = quat[[1, 2, 3, 0]]
+    rotation = quat_xyzw_to_rot(quat)
+    if rotation is not None and inverse:
+        rotation = rotation.T
+    return rotation
+
+
 def pose_guess(previous_rotation, imu_delta):
     """Last ICP pose, plus this spin's gyro turn. Not an absolute heading."""
     if imu_delta is None:
@@ -951,7 +969,21 @@ class ImuTrack:
     behaviour) hands every sweep the whole accumulated heading error again.
     """
 
-    def __init__(self):
+    def __init__(self, quat_order="auto"):
+        if quat_order not in ("auto", "xyzw", "wxyz"):
+            raise ValueError("quat_order must be auto, xyzw or wxyz")
+        # The Unitree driver fills the IMU message as if the quaternion were
+        # x, y, z, w, and its own transform code as if it were w, x, y, z. Read
+        # the wrong way, a turn of the lidar looks like the lidar rolling over,
+        # and every turn redraws the room at a new angle. The gyro is not
+        # ambiguous, so "auto" picks the layout that agrees with it.
+        self.layout = ("xyzw", False) if quat_order == "auto" else (quat_order, False)
+        self.layout_checked = quat_order != "auto"      # True once the gyro (or the user) has settled it
+        self.layout_note = "set by hand" if quat_order != "auto" else "not checked yet"
+        self.needs_anchor = False
+        self._relock_gravity = False
+        self._trial = None
+        self._first_guess_done = quat_order != "auto"
         self.samples = []
         self.accel = []
         self.orientation = None
@@ -979,6 +1011,76 @@ class ImuTrack:
         while len(self.samples) > 2 and self.samples[0][0] < cutoff:
             self.samples.pop(0)
 
+    def learn_layout(self, stamp, quat, gyro, accel):
+        """Work out how the quaternion is laid out. Call with every IMU message until layout_checked.
+
+        At rest, the right layout turns the accelerometer reading to point
+        straight up; that gives a first choice before anything has moved.
+        The first real turn settles it: the change in the quaternion has to
+        match the turn the gyro measured over the same moment.
+        """
+        if self.layout_checked:
+            return
+        quat = np.asarray(quat, dtype=np.float64).reshape(-1)
+        gyro = np.asarray(gyro, dtype=np.float64).reshape(-1)
+        accel = np.asarray(accel, dtype=np.float64).reshape(-1)
+        if quat.shape != (4,) or not np.all(np.isfinite(quat)) or np.linalg.norm(quat) < 1e-6:
+            return
+        if gyro.shape != (3,) or not np.all(np.isfinite(gyro)):
+            return
+        if not self._first_guess_done and accel.shape == (3,) and np.linalg.norm(accel) > 5.0:
+            up = [
+                (quat_to_rot(quat, order) @ accel)[2] / np.linalg.norm(accel) for order in ("xyzw", "wxyz")
+            ]
+            self._first_guess_done = True
+            if up[1] > up[0] + 0.05:
+                self._switch_layout(("wxyz", False), "from gravity, not yet confirmed by a turn")
+            else:
+                self.layout_note = "from gravity, not yet confirmed by a turn"
+        stamp = float(stamp)
+        trial = self._trial
+        if trial is None or not 0 < stamp - trial["last"] <= _MAX_IMU_STEP or stamp - trial["start"] > 4.0:
+            self._trial = {"start": stamp, "last": stamp, "quat": quat.copy(), "turn": np.eye(3)}
+            return
+        trial["turn"] = trial["turn"] @ rodrigues(gyro * (stamp - trial["last"]))
+        trial["last"] = stamp
+        if _rotation_angle(trial["turn"]) < np.radians(15.0):
+            return
+        errors = []
+        for order, inverse in QUAT_LAYOUTS:
+            change = quat_to_rot(trial["quat"], order, inverse).T @ quat_to_rot(quat, order, inverse)
+            errors.append(np.degrees(_rotation_angle(change.T @ trial["turn"])))
+        self._trial = None
+        ranked = np.argsort(errors)
+        if errors[ranked[0]] < 4.0 and errors[ranked[1]] > 8.0:
+            best = QUAT_LAYOUTS[ranked[0]]
+            note = f"confirmed by the gyro (off by {errors[ranked[0]]:.1f}° over a 15° turn)"
+            if best != self.layout:
+                self._switch_layout(best, note)
+            self.layout_note = note
+            self.layout_checked = True
+
+    def _switch_layout(self, layout, note):
+        """Everything remembered under the old layout is wrong. Drop it and ask to be re-anchored."""
+        self.layout = layout
+        self.layout_note = note
+        self.facings.clear()
+        self._facing_stamps.clear()
+        self.accel.clear()
+        self.orientation = None
+        if self.origin is not None:
+            self.needs_anchor = True
+
+    def reanchor(self, map_rotation):
+        """After a layout switch: take the lidar's current facing from the map and carry on from there."""
+        if self.orientation is None:
+            return
+        self.origin = np.array(self.orientation, copy=True)
+        self.correction = np.asarray(map_rotation, dtype=np.float64) @ self.orientation.T
+        self.gravity = None
+        self._relock_gravity = True
+        self.needs_anchor = False
+
     def push_orientation(self, quat, stamp=None, arrival=None):
         """Keep the latest orientation, and its history when the IMU stamp is given.
 
@@ -986,7 +1088,7 @@ class ImuTrack:
         The cloud header is a different clock from the IMU header, so a sweep
         is placed on the IMU clock by when it arrived.
         """
-        rotation = quat_xyzw_to_rot(quat)
+        rotation = quat_to_rot(quat, *self.layout)
         if rotation is None:
             return
         self.orientation = rotation
@@ -1087,6 +1189,7 @@ class ImuTrack:
             return
         samples = [self.correction @ rotation @ accel for _, accel, rotation in self.accel]
         self.gravity = np.mean(samples, axis=0)
+        self._relock_gravity = False
 
     def _map_accel(self, accel, rotation):
         return self.correction @ rotation @ np.asarray(accel, dtype=np.float64) - self.gravity
@@ -1404,9 +1507,9 @@ class Mapper:
     """
 
     def __init__(self, voxel=DEFAULT_VOXEL, max_correspondence=0.4, deskew_sweeps=True,
-                 correct_heading=True):
+                 correct_heading=True, quat_order="auto"):
         self.tracker = Tracker(voxel, max_correspondence)
-        self.imu = ImuTrack()
+        self.imu = ImuTrack(quat_order)
         self.deskew_sweeps = deskew_sweeps
         self.correct_heading = correct_heading
         self.counts = {"seed": 0, "aligned": 0, "tracking": 0, "skipped": 0}
@@ -1419,6 +1522,7 @@ class Mapper:
 
     def on_imu(self, stamp, quat, gyro, accel, arrival=None):
         """One IMU message. ``stamp`` is its header time; ``arrival`` is the Pi's clock."""
+        self.imu.learn_layout(stamp, quat, gyro, accel)
         self.imu.push(stamp, gyro)
         self.imu.push_orientation(quat, stamp, stamp if arrival is None else arrival)
         self.imu.push_accel(stamp, accel)
@@ -1428,6 +1532,8 @@ class Mapper:
         tracker, imu = self.tracker, self.imu
         xyz = np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
         end = imu.imu_time(arrival)
+        if imu.needs_anchor:
+            imu.reanchor(tracker.rotation)
         facing = None if len(tracker.map) == 0 else imu.facing_in_map(end)
         # Without walls to check against, the accelerometer is only good for
         # about a second. Past that, coasting on it carries the pose out of the
@@ -1490,7 +1596,7 @@ class Mapper:
         self.misses = 0 if status in ("seed", "aligned") else self.misses + 1
         if status == "seed":
             imu.lock_origin()
-        if imu.gravity is None and np.linalg.norm(tracker.translation) < 0.02:
+        if imu.gravity is None and (np.linalg.norm(tracker.translation) < 0.02 or imu._relock_gravity):
             imu.lock_gravity()
         if status == "aligned" and self.correct_heading:
             # The walls have just said where the lidar is really facing. Carry
@@ -1527,14 +1633,15 @@ class Mapper:
             f"lidar at {place[0]:.2f} {place[1]:.2f} {place[2]:.2f} m, "
             f"yaw={heading_deg(tracker.rotation):5.1f}° face={face} "
             f"imu heading fix={self.heading_fix_deg:+.1f}°, "
-            f"wall fit {fit}, imu {'on' if imu_on else 'off'}, "
+            f"wall fit {fit}, imu {'on' if imu_on else 'off'} "
+            f"({imu.layout[0]}{' inverse' if imu.layout[1] else ''}{'' if imu.layout_checked else '?'}), "
             f"aligned {counts['aligned']}, tracking {counts['tracking']}, "
             f"skipped {counts['skipped']}"
         )
 
 
 def collect(seconds_between_saves, topic, imu_topic, output, voxel, max_correspondence,
-            deskew_sweeps=True, correct_heading=True):
+            deskew_sweeps=True, correct_heading=True, quat_order="auto"):
     import rclpy
     from rclpy.executors import ExternalShutdownException
     from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
@@ -1543,7 +1650,8 @@ def collect(seconds_between_saves, topic, imu_topic, output, voxel, max_correspo
 
     rclpy.init()
     node = rclpy.create_node("stable_map")
-    mapper = Mapper(voxel, max_correspondence, deskew_sweeps, correct_heading)
+    mapper = Mapper(voxel, max_correspondence, deskew_sweeps, correct_heading, quat_order)
+    layout_said = None
     tracker = mapper.tracker
     # Messages are received on their own thread and stamped as they arrive.
     # Taking them one at a time between sweeps left the IMU reading seconds
@@ -1629,6 +1737,12 @@ def collect(seconds_between_saves, topic, imu_topic, output, voxel, max_correspo
             started = time.monotonic()
             mapper.on_cloud(arrival, xyz, intensity, stamps)
             print(f"{mapper.status_line()}, {time.monotonic() - started:.2f} s", flush=True)
+            layout_now = (mapper.imu.layout, mapper.imu.layout_note)
+            if layout_now != layout_said and mapper.imu.orientation is not None:
+                layout_said = layout_now
+                order, inverse = mapper.imu.layout
+                print(f"IMU quaternion read as {order}{' (inverse)' if inverse else ''}: "
+                      f"{mapper.imu.layout_note}", flush=True)
             if tracker.map and time.monotonic() - last_save >= seconds_between_saves:
                 save()
                 last_save = time.monotonic()
@@ -1658,6 +1772,10 @@ def main():
     )
     parser.add_argument("--save-every", type=float, default=5.0, help="seconds between PCD writes")
     parser.add_argument(
+        "--quat-order", choices=("auto", "xyzw", "wxyz"), default="auto",
+        help="layout of the IMU quaternion. auto checks it against the gyro (default)",
+    )
+    parser.add_argument(
         "--no-deskew", action="store_true",
         help="do not straighten sweeps captured while the lidar was moving (for comparison)",
     )
@@ -1677,6 +1795,7 @@ def main():
         args.max_correspondence,
         deskew_sweeps=not args.no_deskew,
         correct_heading=not args.no_heading_correction,
+        quat_order=args.quat_order,
     )
 
 

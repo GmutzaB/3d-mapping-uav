@@ -103,7 +103,7 @@ class Path:
 
 
 def imu_messages(path, rate=250.0, yaw_drift_deg_s=0.1, gyro_bias=(0.002, -0.001, 0.0017),
-                 seed=0, accel_noise=0.05, tilt_error_deg=0.0):
+                 seed=0, accel_noise=0.05, tilt_error_deg=0.0, quat_order="xyzw"):
     """List of (time, quat_xyzw, gyro, accel). The quaternion's heading wanders off steadily."""
     rng = np.random.default_rng(seed)
     out = []
@@ -118,7 +118,10 @@ def imu_messages(path, rate=250.0, yaw_drift_deg_s=0.1, gyro_bias=(0.002, -0.001
         # tilt_error leans the reported "down" slowly back and forth, as vibration does.
         lean = np.radians(tilt_error_deg) * np.sin(0.7 * t)
         reported = rot_z(np.radians(yaw_drift_deg_s) * t) @ rot_x(lean) @ R
-        out.append((float(t), rot_to_quat_xyzw(reported), gyro, accel))
+        quat = rot_to_quat_xyzw(reported)
+        if quat_order == "wxyz":       # the same rotation with w in the first slot
+            quat = quat[[3, 0, 1, 2]]
+        out.append((float(t), quat, gyro, accel))
     return out
 
 
@@ -150,7 +153,8 @@ def cloud_messages(path, packets=72, seed=1, noise=0.01):
 
 
 def run(path=None, yaw_drift_deg_s=0.1, deskew_sweeps=True, correct_heading=True, sweeps=None,
-        every=1, verbose=False, cloud_delay=0.0, accel_noise=0.05, tilt_error_deg=0.0, return_map=False):
+        every=1, verbose=False, cloud_delay=0.0, accel_noise=0.05, tilt_error_deg=0.0, return_map=False,
+        quat_order="xyzw", read_as="auto"):
     """Drive stable_map.Mapper with a simulated carry. Returns pose and map errors against the truth.
 
     ``every`` works on every Nth cloud only, like a Pi that cannot keep up.
@@ -162,8 +166,8 @@ def run(path=None, yaw_drift_deg_s=0.1, deskew_sweeps=True, correct_heading=True
     path = path or Path()
     clouds = cloud_messages(path)[:sweeps]
     imus = imu_messages(path, yaw_drift_deg_s=yaw_drift_deg_s, accel_noise=accel_noise,
-                        tilt_error_deg=tilt_error_deg)
-    mapper = Mapper(deskew_sweeps=deskew_sweeps, correct_heading=correct_heading)
+                        tilt_error_deg=tilt_error_deg, quat_order=quat_order)
+    mapper = Mapper(deskew_sweeps=deskew_sweeps, correct_heading=correct_heading, quat_order=read_as)
     fed = 0
     start_rotation = start_position = None
     turn_errors, place_errors, seconds = [], [], []
@@ -196,6 +200,7 @@ def run(path=None, yaw_drift_deg_s=0.1, deskew_sweeps=True, correct_heading=True
         "map_points": int(len(off)), "imu_heading_fix_deg": mapper.heading_fix_deg,
         "true_imu_drift_deg": yaw_drift_deg_s * path.duration,
         "seconds_per_sweep": float(np.median(seconds)),
+        "quaternion_read_as": mapper.imu.layout[0], "quaternion_checked": mapper.imu.layout_checked,
     }
     return (result, world, off) if return_map else result
 
@@ -209,6 +214,11 @@ if __name__ == "__main__":
     parser.add_argument("--loop", type=float, default=30.0, help="seconds to carry the lidar round the room")
     parser.add_argument("--every", type=int, default=1, help="work on every Nth cloud (a slow computer)")
     parser.add_argument("--old", action="store_true", help="no heading correction and no deskew")
+    parser.add_argument("--sensor-quat", choices=("xyzw", "wxyz"), default="xyzw",
+                        help="layout the simulated IMU sends its quaternion in")
+    parser.add_argument("--read-as", choices=("auto", "xyzw", "wxyz"), default="auto",
+                        help="layout the mapper is told to read")
     args = parser.parse_args()
-    result = run(Path(loop=args.loop), args.drift, not args.old, not args.old, every=args.every, verbose=True)
+    result = run(Path(loop=args.loop), args.drift, not args.old, not args.old, every=args.every, verbose=True,
+                 quat_order=args.sensor_quat, read_as=args.read_as)
     print(json.dumps(result, indent=2))

@@ -66,6 +66,46 @@ class HeadingCorrection(unittest.TestCase):
         self.assertAlmostEqual(imu.imu_time(50.6), 1000.6, places=6)
 
 
+class QuaternionLayout(unittest.TestCase):
+    """The driver's IMU message and its own transform code disagree on where w sits."""
+
+    def _turning(self, order, rate=np.radians(60.0), seconds=1.0):
+        imu = ImuTrack()
+        for stamp in np.arange(0.0, seconds, 0.004):
+            quat = rot_to_quat_xyzw(rot_z(rate * max(0.0, stamp - 0.3)))
+            if order == "wxyz":
+                quat = quat[[3, 0, 1, 2]]
+            gyro = [0.0, 0.0, rate if stamp >= 0.3 else 0.0]
+            imu.learn_layout(stamp, quat, gyro, [0.0, 0.0, 9.81])
+            imu.push_orientation(quat, stamp, stamp)
+        return imu
+
+    def test_gravity_picks_w_first_before_anything_moves(self):
+        imu = ImuTrack()
+        imu.learn_layout(0.0, [1.0, 0.0, 0.0, 0.0], np.zeros(3), [0.0, 0.0, 9.81])
+        self.assertEqual(imu.layout, ("wxyz", False))
+        self.assertFalse(imu.layout_checked)
+
+    def test_a_turn_confirms_either_layout_against_the_gyro(self):
+        for order in ("xyzw", "wxyz"):
+            imu = self._turning(order)
+            self.assertEqual(imu.layout, (order, False))
+            self.assertTrue(imu.layout_checked)
+            self.assertAlmostEqual(stable_map.heading_deg(imu.orientation), 60.0 * (0.996 - 0.3), delta=0.5)
+
+    def test_carried_loop_is_the_same_whichever_way_the_sensor_sends_it(self):
+        result = run(Path(hold=2.0, loop=10.0), every=2, quat_order="wxyz")
+        self.assertEqual(result["quaternion_read_as"], "wxyz")
+        self.assertEqual(result["counts"]["tracking"] + result["counts"]["skipped"], 0)
+        self.assertLess(result["heading_error_max_deg"], 2.5)
+        self.assertLess(result["map_error_p95_cm"], 4.0)
+
+    def test_reading_it_the_wrong_way_loses_the_room_on_the_first_turn(self):
+        result = run(Path(hold=2.0, loop=10.0), every=2, quat_order="wxyz", read_as="xyzw")
+        self.assertGreater(result["counts"]["tracking"] + result["counts"]["skipped"], 5)
+        self.assertGreater(result["heading_error_max_deg"], 45.0)
+
+
 class Deskew(unittest.TestCase):
     def test_packet_restarts_become_time_across_the_sweep(self):
         one = np.arange(300) * (0.0046875 / 300)
