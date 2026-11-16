@@ -13,7 +13,7 @@ Wants=network-online.target
 
 [Service]
 User=ubuntu
-ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source /home/ubuntu/3d-mapping-uav/ros2_ws/install/setup.bash && exec ros2 launch uav_lidar_bridge uav.launch.py'
+ExecStart=/bin/bash -c 'if [[ -f /opt/ros/lyrical/setup.bash ]]; then source /opt/ros/lyrical/setup.bash; else source /opt/ros/jazzy/setup.bash; fi && source /home/ubuntu/3d-mapping-uav/ros2_ws/install/setup.bash && exec ros2 launch uav_lidar_bridge uav.launch.py'
 Restart=on-failure
 RestartSec=3
 

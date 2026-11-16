@@ -1,6 +1,6 @@
 # ROS 2 workspace (Raspberry Pi 5)
 
-Runs on the drone's Pi 5 with Ubuntu 24.04 and ROS 2 Jazzy:
+Runs on the drone's Pi 5 with Ubuntu 24.04 (ROS 2 Jazzy) or Ubuntu 26.04 (ROS 2 Lyrical):
 
 - **Unitree L2 driver** publishes the point cloud (`/unilidar/cloud`) and IMU (`/unilidar/imu`).
 - **MAVROS** talks MAVLink to the ArduCopter flight controller and exposes it as ROS 2 topics (`/mavros/state`, `/mavros/local_position/pose`, `/mavros/imu/data`, ...).
@@ -20,9 +20,9 @@ pi/
 
 ## 1. Put Ubuntu on the Pi
 
-ROS 2 Jazzy has prebuilt packages for Ubuntu 24.04 but not Raspberry Pi OS, so reflash the SD card:
+These ROS 2 packages exist for Ubuntu, not Raspberry Pi OS. Use Ubuntu Server 24.04 LTS or 26.04 LTS, 64-bit. `pi/install.sh` installs Jazzy on 24.04 and Lyrical on 26.04.
 
-1. Open **Raspberry Pi Imager** → Device: Raspberry Pi 5 → OS: *Other general-purpose OS → Ubuntu → Ubuntu Server 24.04 LTS (64-bit)*.
+1. Open **Raspberry Pi Imager** → Device: Raspberry Pi 5 → OS: *Other general-purpose OS → Ubuntu → Ubuntu Server 24.04 LTS or 26.04 LTS (64-bit)*.
 2. In the settings (gear icon), set the username to `ubuntu`, a password, your Wi-Fi, and enable SSH.
 3. Boot the Pi and SSH in: `ssh ubuntu@<pi-ip>`.
 
@@ -56,30 +56,67 @@ If your Wi-Fi network also uses `192.168.1.x`, the two will clash. Change the L2
 - **USB** (easiest for bench testing): H743 USB → Pi USB. Default `fcu_url` is `serial:///dev/ttyACM0:115200`.
 - **UART** (for flight): H743 TELEM TX/RX/GND → Pi GPIO 15 (RX) / 14 (TX) / GND. Add `dtparam=uart0=on` to `/boot/firmware/config.txt` and reboot. In ArduPilot set that port's `SERIALn_PROTOCOL = 2` and `SERIALn_BAUD = 921`. Launch with `fcu_url:=serial:///dev/ttyAMA0:921600`.
 
-## 4. Run
+## 4. Start the lidar on the Pi
+
+Two programs. The first one has to keep running for the whole session. It is the driver: it is what sends and receives the packets on the Ethernet cable, and it publishes `/unilidar/cloud` and `/unilidar/imu`. The mapper does not talk to the lidar. If you close that first window, the packets stop and the map has nothing to read.
+
+Open two SSH sessions. In both of them, new terminals do not know `ros2` until you source it. On Ubuntu 26.04:
+
+```sh
+source /opt/ros/lyrical/setup.bash
+source ~/3d-mapping-uav/ros2_ws/install/setup.bash
+```
+
+On Ubuntu 24.04, use `/opt/ros/jazzy/setup.bash` instead of lyrical. Pull the latest code before starting (`git pull` in `~/3d-mapping-uav`).
+
+**Terminal 1 — leave this running.** This is the program that captures the data going back and forth with the lidar:
+
+```sh
+cd ~/3d-mapping-uav/ros2_ws
+ros2 launch uav_lidar_bridge uav.launch.py mavros:=false obstacles:=false
+```
+
+Wait until it stays up without exiting. Check it from anywhere else with `ros2 topic hz /unilidar/cloud`. You want a steady rate. `ping 192.168.1.62` should already succeed. If it does, do not apply `pi/60-unitree-lidar.yaml`; putting that address on the Ethernet port can take down Wi-Fi.
+
+**Terminal 2 — the map.** Start this only after terminal 1 is publishing:
+
+```sh
+python3 ~/3d-mapping-uav/ros2_ws/pi/stable_map.py
+```
+
+Hold the lidar still for about 2 seconds, then turn slowly. `yaw=` is the map heading and should climb as you face a new direction. `dIMU=` is the gyro turn on that spin. One room should stay put. `skipped` means that sweep did not land on the map, so pause instead of walking on. Ctrl-C writes `~/map.pcd` (it is also rewritten every 5 seconds). Copy it to a computer and open it in CloudCompare:
+
+```sh
+scp mtbf@mtbf:~/map.pcd .
+```
+
+Use the same user and host you SSH with, if that is not `mtbf@mtbf`.
+
+A still snapshot, without building a map, also needs terminal 1 running. Keep the lidar still:
+
+```sh
+python3 ~/3d-mapping-uav/ros2_ws/pi/save_scan.py
+```
+
+That writes `~/scan.pcd`.
+
+Flight-controller options, when you want them, replace the launch line in terminal 1:
 
 ```sh
 ros2 launch uav_lidar_bridge uav.launch.py
-```
-
-Useful options:
-
-```sh
 ros2 launch uav_lidar_bridge uav.launch.py fcu_url:=serial:///dev/ttyAMA0:921600
-ros2 launch uav_lidar_bridge uav.launch.py mavros:=false      # LiDAR only, no flight controller
 ros2 launch uav_lidar_bridge uav.launch.py lidar:=false obstacles:=false   # MAVROS only
 ros2 launch uav_lidar_bridge uav.launch.py gcs_url:=udp-b://@  # also relay to Mission Planner on the network
 ```
 
-Check that data is flowing (in a second SSH session):
+With MAVROS included, a second session can check:
 
 ```sh
-ros2 topic hz /unilidar/cloud
 ros2 topic echo /mavros/state --once          # connected: true
 ros2 topic echo /mavros/obstacle/send --once  # 72 ranges, NaN = nothing seen
 ```
 
-To start everything at boot, see the comments at the top of `pi/uav-ros.service`.
+To start the driver at boot, see the comments at the top of `pi/uav-ros.service`. The service file still has a placeholder home directory; the two terminals above are the setup that matches a normal SSH session.
 
 ## 5. Before trusting obstacle avoidance
 
