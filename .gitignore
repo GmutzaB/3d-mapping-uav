@@ -15,6 +15,10 @@ outputs/grid_comparison/*
 outputs/control/*
 !outputs/control/*.png
 !outputs/control/*.gif
+!outputs/gust/
+outputs/gust/*
+!outputs/gust/*.png
+!outputs/gust/*.gif
 .mplconfig/
 
 # Downloaded supporting software and robotics build products
