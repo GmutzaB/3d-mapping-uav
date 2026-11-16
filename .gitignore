@@ -19,6 +19,12 @@ outputs/control/*
 outputs/gust/*
 !outputs/gust/*.png
 !outputs/gust/*.gif
+!outputs/endurance/
+outputs/endurance/*
+!outputs/endurance/*.png
+!outputs/survey/
+outputs/survey/*
+!outputs/survey/*.png
 .mplconfig/
 
 # Downloaded supporting software and robotics build products

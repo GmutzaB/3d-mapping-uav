@@ -41,7 +41,12 @@ voltage was not restated. Say so if these motors are on a different cell count.
 
 ## Battery
 
-One aircraft, two candidate packs. `--battery-mah` accepts `7000` or `10000`.
+**Selected (November 16, 2026): 9000 mAh, 80C LiPo**, 6S assumed (199.8 Wh nominal).
+Mass not yet weighed; `battery_endurance.py` and `survey_flight.py` use a 1.15 kg
+estimate (comparable 6S ~9 Ah packs weigh ~1.06–1.18 kg) and sweep 0.95–1.35 kg.
+The airflow scripts below still accept only the two earlier candidates.
+
+Earlier candidates: one aircraft, two packs. `--battery-mah` accepts `7000` or `10000`.
 The default run records 7000 mAh and also stores the other pack's energy.
 
 | Pack | Nominal energy at 6S |
